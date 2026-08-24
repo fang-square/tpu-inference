@@ -24,12 +24,15 @@ from vllm.transformers_utils.config import set_default_rope_theta
 
 from tpu_inference import envs, utils
 from tpu_inference.distributed.jax_parallel_state import get_pp_group
+from tpu_inference.kernels.collectives.fused_all_reduce_matmul import \
+    fused_all_reduce_matmul
 from tpu_inference.layers.common.attention_interface import attention
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.quantization import quantize_kv
 from tpu_inference.layers.jax import JaxModule
 from tpu_inference.layers.jax.embed import JaxEmbed
-from tpu_inference.layers.jax.linear import JaxEinsum, JaxLmHead
+from tpu_inference.layers.jax.layers import FlaxUtils
+from tpu_inference.layers.jax.linear import JaxEinsum, JaxLinear, JaxLmHead
 from tpu_inference.layers.jax.norm import JaxRmsNorm
 from tpu_inference.layers.jax.pp_utils import PPMissingLayer, make_layers
 from tpu_inference.layers.jax.rope_interface import (apply_rope,
@@ -39,14 +42,43 @@ from tpu_inference.layers.vllm.quantization.configs import VllmQuantConfig
 from tpu_inference.logger import init_logger
 from tpu_inference.models.jax.jax_intermediate_tensor import \
     JaxIntermediateTensors
-from tpu_inference.models.jax.qwen2 import Qwen2DecoderLayer
-from tpu_inference.models.jax.qwen2 import Qwen2MLP as Qwen3MLP
-from tpu_inference.models.jax.qwen2 import Qwen2Model
+from tpu_inference.models.jax.qwen2 import Qwen2DecoderLayer, Qwen2Model
 from tpu_inference.models.jax.utils.weight_utils import LoadableWithIterator
 
 logger = init_logger(__name__)
 
 init_fn = nnx.initializers.uniform()
+modeling_flax_utils = FlaxUtils()
+def _quantize_to_fp8_with_scale(
+    arr: jax.Array,
+    channelwise_axis: int | None = None,
+    target_qtype: jnp.dtype = jnp.float8_e4m3fn,
+) -> tuple[jax.Array, jax.Array | None]:
+    """Quantizes an array to target FP8 dtype and computes scaling factors.
+
+    If the array is already a QArray or FP8, extracts qvalue and scale.
+    Otherwise, applies dynamic absmax quantization.
+    """
+    if hasattr(arr, "qvalue"):
+        qval = arr.qvalue
+        scale = getattr(arr, "scale", None)
+        return qval, scale
+    if hasattr(arr, "array") and hasattr(arr.array, "qvalue"):
+        qval = arr.array.qvalue
+        scale = getattr(arr.array, "scale", None)
+        return qval, scale
+    if arr.dtype == target_qtype:
+        return arr, None
+
+    if channelwise_axis is not None:
+        arr_max = jnp.max(jnp.abs(arr), axis=channelwise_axis, keepdims=True)
+    else:
+        arr_max = jnp.max(jnp.abs(arr), keepdims=True)
+
+    scale = jnp.maximum(arr_max / 448.0, 1e-12).astype(arr.dtype)
+    qval = jnp.clip(arr / scale, -448.0, 448.0).astype(target_qtype)
+    return qval, scale
+
 
 
 class Qwen3Attention(JaxModule):
@@ -205,8 +237,100 @@ class Qwen3Attention(JaxModule):
             v_scale=v_scale,
         )
         # (T, D)
-        o = self.o_proj(outputs)
+        if envs.USE_FUSED_ALL_REDUCE_MATMUL:
+            outputs_2d = outputs.reshape((outputs.shape[0], -1))
+            w_o_val = self.o_proj.weight.value.reshape((-1, self.hidden_size))
+            x_in, x_scale = _quantize_to_fp8_with_scale(outputs_2d, channelwise_axis=-1)
+            w_o, w_scale = _quantize_to_fp8_with_scale(w_o_val, channelwise_axis=0)
+            k_local = x_in.shape[1]
+            o = fused_all_reduce_matmul(
+                x_in,
+                w_o,
+                x_scale=x_scale,
+                w_scale=w_scale,
+                mesh=self.mesh,
+                axis_name="model",
+                out_dtype=outputs.dtype,
+                block_m=envs.FUSED_AR_BLOCK_M,
+                block_n=envs.FUSED_AR_BLOCK_N,
+                block_k=k_local,
+                pipeline_mode=envs.FUSED_AR_PIPELINE_MODE,
+            )
+        else:
+            o = self.o_proj(outputs)
         return new_kv_cache, o
+
+
+class Qwen3MLP(JaxModule):
+
+    def __init__(self,
+                 config: Qwen3Config,
+                 dtype: jnp.dtype,
+                 rng: nnx.Rngs,
+                 mesh: Mesh,
+                 quant_config: VllmQuantConfig,
+                 prefix: str = ""):
+        hidden_size = config.hidden_size
+        intermediate_size = config.intermediate_size
+        act = config.hidden_act
+
+        self.mesh = mesh
+        self.hidden_size = hidden_size
+        self.intermediate_size = intermediate_size
+
+        self.gate_proj = JaxLinear(
+            hidden_size,
+            intermediate_size,
+            use_bias=False,
+            dtype=dtype,
+            kernel_init=nnx.with_partitioning(init_fn, (None, "model")),
+            rngs=rng,
+            quant_config=quant_config,
+            prefix=prefix + ".gate_proj",
+        )
+        self.up_proj = JaxLinear(
+            hidden_size,
+            intermediate_size,
+            use_bias=False,
+            dtype=dtype,
+            kernel_init=nnx.with_partitioning(init_fn, (None, "model")),
+            rngs=rng,
+            quant_config=quant_config,
+            prefix=prefix + ".up_proj",
+        )
+        self.down_proj = JaxLinear(
+            intermediate_size,
+            hidden_size,
+            use_bias=False,
+            dtype=dtype,
+            kernel_init=nnx.with_partitioning(init_fn, ("model", None)),
+            rngs=rng,
+            quant_config=quant_config,
+            prefix=prefix + ".down_proj",
+        )
+        self.act_fn = modeling_flax_utils.ACT2FN[act]
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        gate = self.act_fn(self.gate_proj(x))
+        up = self.up_proj(x)
+        fuse = gate * up
+        if envs.USE_FUSED_ALL_REDUCE_MATMUL:
+            fuse_in, fuse_scale = _quantize_to_fp8_with_scale(fuse, channelwise_axis=-1)
+            w_down, w_scale = _quantize_to_fp8_with_scale(self.down_proj.weight.value, channelwise_axis=0)
+            return fused_all_reduce_matmul(
+                fuse_in,
+                w_down,
+                x_scale=fuse_scale,
+                w_scale=w_scale,
+                mesh=self.mesh,
+                axis_name="model",
+                out_dtype=fuse.dtype,
+                block_m=envs.FUSED_AR_BLOCK_M,
+                block_n=envs.FUSED_AR_BLOCK_N,
+                block_k=6400,
+                pipeline_mode=envs.FUSED_AR_PIPELINE_MODE,
+            )
+        return self.down_proj(fuse)
 
 
 class Qwen3DecoderLayer(Qwen2DecoderLayer):
@@ -253,6 +377,7 @@ class Qwen3DecoderLayer(Qwen2DecoderLayer):
             config=config,
             dtype=dtype,
             rng=rng,
+            mesh=mesh,
             quant_config=quant_config,
             prefix=prefix + ".mlp",
         )

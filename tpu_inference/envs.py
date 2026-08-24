@@ -80,6 +80,11 @@ if TYPE_CHECKING:
     VLLM_TPU_BUCKET_PADDING_GAP: int = 0
     VLLM_INCREMENTAL_FP8_LOADING: bool = False
     TPU_MESH_SORT_BY_COORDS: bool = False
+    USE_FUSED_ALL_REDUCE_MATMUL: bool = False
+    FUSED_AR_PIPELINE_MODE: str = "5stage"
+    FUSED_AR_BLOCK_M: int = 1024
+    FUSED_AR_BLOCK_N: int = 1024
+    FUSED_AR_BLOCK_K: int = 4096
 
 
 def env_with_choices(
@@ -472,6 +477,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # when initializing large FP8 models on smaller RAM TPUs such as TPU8i.
     "VLLM_INCREMENTAL_FP8_LOADING":
     env_bool("VLLM_INCREMENTAL_FP8_LOADING", default=False),
+    "USE_FUSED_ALL_REDUCE_MATMUL":
+    env_bool("USE_FUSED_ALL_REDUCE_MATMUL", default=False),
+    "FUSED_AR_PIPELINE_MODE":
+    env_with_choices("FUSED_AR_PIPELINE_MODE",
+                     default="5stage",
+                     choices=["5stage", "all2all", "ring"]),
+    "FUSED_AR_BLOCK_M":
+    lambda: int(os.getenv("FUSED_AR_BLOCK_M", "1024")),
+    "FUSED_AR_BLOCK_N":
+    lambda: int(os.getenv("FUSED_AR_BLOCK_N", "1024")),
+    "FUSED_AR_BLOCK_K":
+    lambda: int(os.getenv("FUSED_AR_BLOCK_K", "4096")),
 }
 
 

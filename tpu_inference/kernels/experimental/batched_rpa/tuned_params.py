@@ -277,9 +277,16 @@ def calculate_block_sizes(
     decode_batch_size = 8
     prefill_batch_size = 2
 
-    decode_block_sizes = find_best_block_sizes(decode_batch_size, n_buffer, 1)
-    prefill_block_sizes = find_best_block_sizes(prefill_batch_size, n_buffer)
+    # decode_block_sizes = find_best_block_sizes(decode_batch_size, n_buffer, 1)
+    # prefill_block_sizes = find_best_block_sizes(prefill_batch_size, n_buffer)
 
+    # decode hlo need
+    # decode_block_sizes = configs.BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=2048, batch_size=4, n_buffer=3)
+    # prefill_block_sizes = configs.BlockSizes(bq_sz=128, bq_c_sz=128, bkv_sz=128, batch_size=1, n_buffer=3)
+    
+    # prefill hlo need
+    prefill_block_sizes = configs.BlockSizes(bq_sz=512, bq_c_sz=512, bkv_sz=256, batch_size=1, n_buffer=3)
+    decode_block_sizes = configs.BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=128, batch_size=1, n_buffer=3)
     return decode_block_sizes, prefill_block_sizes
 
 

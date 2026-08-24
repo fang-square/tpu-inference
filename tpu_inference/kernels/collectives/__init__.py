@@ -11,3 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from tpu_inference.kernels.collectives.all_gather_matmul import all_gather_matmul
+from tpu_inference.kernels.collectives.fused_all_reduce_matmul import fused_all_reduce_matmul
+
+__all__ = ["all_gather_matmul", "fused_all_reduce_matmul"]
