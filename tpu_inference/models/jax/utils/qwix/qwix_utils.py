@@ -14,7 +14,27 @@ from flax.typing import PRNGKey
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from qwix._src.core.qarray import QArray
-from qwix._src.providers import ptq
+from qwix._src.core import qarray as _qwix_qarray
+from qwix._src.providers import ptq as _qwix_ptq
+ptq = _qwix_ptq
+
+if not getattr(_qwix_qarray.quantize, "_is_qarray_safe", False):
+    _orig_quantize = _qwix_qarray.quantize
+    def _safe_quantize(array, how):
+        if hasattr(array, "qvalue") or isinstance(array, _qwix_qarray.QArray):
+            return array
+        return _orig_quantize(array, how)
+    _safe_quantize._is_qarray_safe = True
+    _qwix_qarray.quantize = _safe_quantize
+
+if hasattr(_qwix_ptq, "quantize_act") and not getattr(_qwix_ptq.quantize_act, "_is_qarray_safe", False):
+    _orig_quantize_act = _qwix_ptq.quantize_act
+    def _safe_quantize_act(array, how, rule, act_name, **kwargs):
+        if hasattr(array, "qvalue") or isinstance(array, _qwix_qarray.QArray):
+            return array
+        return _orig_quantize_act(array, how, rule, act_name, **kwargs)
+    _safe_quantize_act._is_qarray_safe = True
+    _qwix_ptq.quantize_act = _safe_quantize_act
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig

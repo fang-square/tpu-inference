@@ -82,9 +82,25 @@ if TYPE_CHECKING:
     TPU_MESH_SORT_BY_COORDS: bool = False
     USE_FUSED_ALL_REDUCE_MATMUL: bool = False
     FUSED_AR_PIPELINE_MODE: str = "5stage"
-    FUSED_AR_BLOCK_M: int = 1024
+    FUSED_AR_BLOCK_M: int = 2048
     FUSED_AR_BLOCK_N: int = 1024
-    FUSED_AR_BLOCK_K: int = 4096
+    FUSED_AR_BLOCK_K: int = 2048
+    FUSED_AR_ATTN_BLOCK_M: int | None = None
+    FUSED_AR_ATTN_BLOCK_N: int | None = None
+    FUSED_AR_ATTN_BLOCK_K: int | None = None
+    FUSED_AR_MLP_BLOCK_M: int | None = None
+    FUSED_AR_MLP_BLOCK_N: int | None = None
+    FUSED_AR_MLP_BLOCK_K: int | None = None
+    USE_FUSED_RMSNORM_FP8: bool = False
+    FUSED_RMSNORM_BLOCK_M: int = 512
+    FUSED_RMSNORM_BLOCK_K: int | None = None
+    USE_FUSED_SWIGLU: bool = False
+    FUSED_SWIGLU_PIPELINE_MODE: str = "grid"
+    FUSED_SWIGLU_QUANT_MODE: str = "channelwise_separate_pallas"
+    FUSED_SWIGLU_BLOCK_M: int = 2048
+    FUSED_SWIGLU_BLOCK_N: int = 512
+    FUSED_SWIGLU_BLOCK_K: int = 5120
+    FUSED_SWIGLU_SUBCHANNEL_K: int = 512
 
 
 def env_with_choices(
@@ -484,11 +500,57 @@ environment_variables: dict[str, Callable[[], Any]] = {
                      default="5stage",
                      choices=["5stage", "all2all", "ring"]),
     "FUSED_AR_BLOCK_M":
-    lambda: int(os.getenv("FUSED_AR_BLOCK_M", "1024")),
+    lambda: int(os.getenv("FUSED_AR_BLOCK_M", "2048")),
     "FUSED_AR_BLOCK_N":
     lambda: int(os.getenv("FUSED_AR_BLOCK_N", "1024")),
     "FUSED_AR_BLOCK_K":
-    lambda: int(os.getenv("FUSED_AR_BLOCK_K", "4096")),
+    lambda: int(os.getenv("FUSED_AR_BLOCK_K", "2048")),
+    "FUSED_AR_ATTN_BLOCK_M":
+    lambda: int(os.environ["FUSED_AR_ATTN_BLOCK_M"]) if "FUSED_AR_ATTN_BLOCK_M" in os.environ else None,
+    "FUSED_AR_ATTN_BLOCK_N":
+    lambda: int(os.environ["FUSED_AR_ATTN_BLOCK_N"]) if "FUSED_AR_ATTN_BLOCK_N" in os.environ else None,
+    "FUSED_AR_ATTN_BLOCK_K":
+    lambda: int(os.environ["FUSED_AR_ATTN_BLOCK_K"]) if "FUSED_AR_ATTN_BLOCK_K" in os.environ else None,
+    "FUSED_AR_MLP_BLOCK_M":
+    lambda: int(os.environ["FUSED_AR_MLP_BLOCK_M"]) if "FUSED_AR_MLP_BLOCK_M" in os.environ else None,
+    "FUSED_AR_MLP_BLOCK_N":
+    lambda: int(os.environ["FUSED_AR_MLP_BLOCK_N"]) if "FUSED_AR_MLP_BLOCK_N" in os.environ else None,
+    "FUSED_AR_MLP_BLOCK_K":
+    lambda: int(os.environ["FUSED_AR_MLP_BLOCK_K"]) if "FUSED_AR_MLP_BLOCK_K" in os.environ else None,
+    "USE_FUSED_RMSNORM_FP8":
+    env_bool("USE_FUSED_RMSNORM_FP8", default=False),
+    "FUSED_RMSNORM_BLOCK_M":
+    lambda: int(os.getenv("FUSED_RMSNORM_BLOCK_M", "512")),
+    "FUSED_RMSNORM_BLOCK_K":
+    lambda: int(os.environ["FUSED_RMSNORM_BLOCK_K"]) if "FUSED_RMSNORM_BLOCK_K" in os.environ else None,
+    "USE_FUSED_SWIGLU":
+    env_bool("USE_FUSED_SWIGLU", default=False),
+    "FUSED_SWIGLU_PIPELINE_MODE":
+    env_with_choices("FUSED_SWIGLU_PIPELINE_MODE",
+                     default="grid",
+                     choices=["grid", "pipelined"]),
+    "FUSED_SWIGLU_QUANT_MODE":
+    env_with_choices("FUSED_SWIGLU_QUANT_MODE",
+                     default="channelwise_separate_pallas",
+                     choices=[
+                         "channelwise_separate_pallas",
+                         "channgelwise_separate_pallas",
+                         "channelwise",
+                         "subchannel",
+                         "separate_channelwise",
+                         "channelwise_separate",
+                         "channelwise_separate_xla",
+                         "separate",
+                         "none",
+                     ]),
+    "FUSED_SWIGLU_BLOCK_M":
+    lambda: int(os.getenv("FUSED_SWIGLU_BLOCK_M", "2048")),
+    "FUSED_SWIGLU_BLOCK_N":
+    lambda: int(os.getenv("FUSED_SWIGLU_BLOCK_N", "512")),
+    "FUSED_SWIGLU_BLOCK_K":
+    lambda: int(os.getenv("FUSED_SWIGLU_BLOCK_K", "5120")),
+    "FUSED_SWIGLU_SUBCHANNEL_K":
+    lambda: int(os.getenv("FUSED_SWIGLU_SUBCHANNEL_K", "512")),
 }
 
 

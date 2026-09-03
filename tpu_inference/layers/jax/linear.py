@@ -173,6 +173,9 @@ class JaxLmHead(nnx.Einsum, JaxModule):
         self.quant_method = None
 
     def __call__(self, inputs: jax.Array) -> jax.Array:
+        if hasattr(inputs, "qvalue") and hasattr(inputs, "scale"):
+            scale = inputs.scale if inputs.scale is not None else 1.0
+            inputs = inputs.qvalue.astype(jnp.bfloat16) * scale
         return jax.numpy.einsum(self.einsum_str, inputs, self.weight.value)
 
 

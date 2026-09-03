@@ -394,3 +394,102 @@ class TestQwen3ForCausalLM:
         assert embed_weight.shape[0] == expected_padded_vocab_size
         if vocab_size % 2 != 0:
             assert embed_weight.shape[0] > vocab_size
+
+    def test_qwen3_fused_rmsnorm_fp8(self, rng, mesh, mock_model_inputs):
+        """Tests model forward execution with fused RMSNorm FP8 kernel enabled."""
+        from tpu_inference import envs
+        init_pp_distributed_environment(
+            ip="",
+            rank=0,
+            world_size=1,
+            device=jax.devices()[0],
+            need_pp=False,
+        )
+        mock_vllm_config = MockVllmConfig("Qwen/Qwen3-0.6B", "auto")
+
+        with jax.set_mesh(mesh):
+            model = Qwen3ForCausalLM(mock_vllm_config, rng, mesh)
+
+        hf_config = mock_vllm_config.model_config.hf_config
+        hidden_size = hf_config.hidden_size
+        num_kv_heads = hf_config.num_key_value_heads
+        head_dim = 128
+
+        kv_caches = create_kv_caches(
+            num_blocks=16,
+            block_size=32,
+            num_kv_heads=num_kv_heads,
+            head_size=head_dim,
+            mesh=mesh,
+            layer_names=["layer"] * hf_config.num_hidden_layers,
+            cache_dtype=jnp.bfloat16)
+
+        input_ids, attention_metadata, indices_do_sample = mock_model_inputs
+
+        with patch.object(envs, "USE_FUSED_RMSNORM_FP8", True):
+            kv_caches, hidden_states, aux_hidden_states, _ = model(
+                kv_caches, input_ids, attention_metadata)
+            assert hidden_states.shape == (8, hidden_size)
+            assert len(aux_hidden_states) == 0
+
+            hidden_states = hidden_states[indices_do_sample]
+            assert hidden_states.shape == (1, hidden_size)
+
+            logits = model.compute_logits(hidden_states)
+            assert logits.shape == (1, hf_config.vocab_size)
+
+    def test_qwen3_fused_rmsnorm_fp8_with_qwix(self, rng, mesh, mock_model_inputs):
+        """Tests model forward execution with fused RMSNorm FP8 kernel AND Qwix FP8 enabled."""
+        from tpu_inference import envs
+        init_pp_distributed_environment(
+            ip="",
+            rank=0,
+            world_size=1,
+            device=jax.devices()[0],
+            need_pp=False,
+        )
+        mock_vllm_config = MockVllmConfig("Qwen/Qwen3-0.6B", "fp8")
+        mock_vllm_config.additional_config["quantization"] = dict(
+            qwix=dict(rules=[{
+                "module_path": ".*",
+                "weight_qtype": "float8_e4m3fn",
+                "act_qtype": "float8_e4m3fn"
+            }]))
+
+        with jax.set_mesh(mesh):
+            model = Qwen3ForCausalLM(mock_vllm_config, rng, mesh)
+
+        # Apply Qwix quantization
+        model = apply_qwix_quantization(mock_vllm_config,
+                                        model,
+                                        rng,
+                                        mesh,
+                                        apply_to_abstract_model=False)
+
+        hf_config = mock_vllm_config.model_config.hf_config
+        hidden_size = hf_config.hidden_size
+        num_kv_heads = hf_config.num_key_value_heads
+        head_dim = 128
+
+        kv_caches = create_kv_caches(
+            num_blocks=16,
+            block_size=32,
+            num_kv_heads=num_kv_heads,
+            head_size=head_dim,
+            mesh=mesh,
+            layer_names=["layer"] * hf_config.num_hidden_layers,
+            cache_dtype=jnp.float8_e4m3fn)
+
+        input_ids, attention_metadata, indices_do_sample = mock_model_inputs
+
+        with patch.object(envs, "USE_FUSED_RMSNORM_FP8", True):
+            kv_caches, hidden_states, aux_hidden_states, _ = model(
+                kv_caches, input_ids, attention_metadata)
+            assert hidden_states.shape == (8, hidden_size)
+            assert len(aux_hidden_states) == 0
+
+            hidden_states = hidden_states[indices_do_sample]
+            assert hidden_states.shape == (1, hidden_size)
+
+            logits = model.compute_logits(hidden_states)
+            assert logits.shape == (1, hf_config.vocab_size)

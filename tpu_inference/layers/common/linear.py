@@ -70,7 +70,11 @@ def xla_quantized_matmul(
         if quantize_activation and jnp.issubdtype(w_q.dtype, jnp.integer):
             acc_dtype = jnp.int32
 
-        x_q, x_scale = quantize_tensor(x, w_q.dtype)
+        if hasattr(x, "qvalue") and hasattr(x, "scale"):
+            x_q = x.qvalue
+            x_scale = x.scale
+        else:
+            x_q, x_scale = quantize_tensor(x, w_q.dtype)
         out = jax.lax.dot_general(
             x_q,
             w_q,

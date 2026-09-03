@@ -376,10 +376,13 @@ def ragged_paged_attention(
             cfgs=cfgs,
             update_kv_cache=update_kv_cache,
         )
+        kernel_page_indices = page_indices
+        if kernel_page_indices.shape[0] < 128:
+            kernel_page_indices = jnp.pad(kernel_page_indices, (0, 128 - kernel_page_indices.shape[0]))
         return kernel.rpa_kernel(
             cu_q_lens,
             kv_lens,
-            page_indices,
+            kernel_page_indices,
             schedule_hbm,
             o_hbm_alias_q_hbm,
             new_kv_hbm,

@@ -215,9 +215,7 @@ class RpaConfigs:
 
     @property
     def bkv_p_cache(self) -> int:
-        if self.mode == RpaCase.PREFILL:
-            return 0
-        return self.bkv_p
+        return max(1, self.bkv_p)
 
     @property
     def bkv_p_new(self) -> int:
