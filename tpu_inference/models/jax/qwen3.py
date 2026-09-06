@@ -384,7 +384,7 @@ class Qwen3Attention(JaxModule):
                 num_q_heads_per_kv,
                 self.head_dim,
             )
-            einsum_str = f"TD,{rhs_str}->KTGH"
+            einsum_str = f"KTD,{rhs_str}->KTGH"
         elif envs.LAYOUT_Q_PROJ_AS_NDH:
             rhs_str = "NDH"
             q_proj_sharding = ("model", None, None)
@@ -487,11 +487,18 @@ class Qwen3Attention(JaxModule):
         )
 
         # q: (T, N, H) or (K, T, G, H)
-        q = self.q_proj(x)
+        if envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA:
+            x_q = jnp.broadcast_to(
+                x[None, :, :], (self.num_kv_heads, x.shape[0], self.hidden_size)
+            )
+            q = self.q_proj(x_q)
+        else:
+            q = self.q_proj(x)
         q = self.q_norm(q)
 
         # k: (T, K, H)
         k = self.k_proj(x)
+        k = self.k_norm(k)
         k = self.k_norm(k)
 
         # v: (T, K, H)

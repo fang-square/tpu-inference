@@ -133,11 +133,12 @@ def prepare_inputs(
   if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
     num_lanes = utils.get_num_lanes()
     padded_total_tokens = utils.align_to(total_q_tokens, num_lanes)
+    kv_stacked = jnp.stack([k, v], axis=1).reshape(
+        total_q_tokens, actual_num_kv_heads_x2, actual_head_dim
+    )
     new_kv_hbm = (
         jnp.pad(
-            jnp.concatenate([k, v], axis=-1).reshape(
-                total_q_tokens, actual_num_kv_heads_x2, actual_head_dim
-            ),
+            kv_stacked,
             (
                 (0, padded_total_tokens - total_q_tokens),
                 (0, 0),
@@ -154,21 +155,21 @@ def prepare_inputs(
         .transpose(1, 2, 3, 0)
     )
   else:
-    new_kv_hbm = jnp.pad(
-        jnp.concatenate([k, v], axis=-1).reshape(
-            total_q_tokens, actual_num_kv_heads_x2, actual_head_dim
-        ),
-        (
-            (0, 0),
-            (0, num_kv_heads_x2_aligned - actual_num_kv_heads_x2),
-            (0, aligned_kv_head_dim - actual_head_dim),
-        ),
-        constant_values=0,
-    ).reshape(
+    kv_stacked = jnp.stack([k, v], axis=1).reshape(
         total_q_tokens,
         num_kv_heads_x2_aligned // kv_packing,
         kv_packing,
-        aligned_kv_head_dim,
+        actual_head_dim,
+    )
+    new_kv_hbm = jnp.pad(
+        kv_stacked,
+        (
+            (0, 0),
+            (0, 0),
+            (0, 0),
+            (0, aligned_kv_head_dim - actual_head_dim),
+        ),
+        constant_values=0,
     )
   return o_hbm_alias_q_hbm, new_kv_hbm
 
