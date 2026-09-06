@@ -324,7 +324,7 @@ def _get_qwix_fp8_weight(
     If not yet quantized and Qwix FP8 is active, manually quantizes the weight
     using Qwix (manually_quantize_qwix_weight) and updates layer.weight.
     """
-    weight_param = getattr(layer, "weight", None)
+    weight_param = getattr(layer, "kernel", getattr(layer, "weight", None))
     if weight_param is None:
         return _quantize_to_fp8_with_scale(layer, channelwise_axis=channelwise_axis, target_qtype=jnp.float8_e4m3fn)
 
@@ -372,22 +372,35 @@ class Qwen3Attention(JaxModule):
                                                        sharding_size)
 
         self.mesh = mesh
+        self.additional_config = additional_config
 
-        # NOTE: LAYOUT_Q_PROJ_AS_NDH is by default False
-        if envs.LAYOUT_Q_PROJ_AS_NDH:
+        if envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA:
+            rhs_str = "KDGH"
+            num_q_heads_per_kv = self.num_heads // self.num_kv_heads
+            q_proj_sharding = ("model", None, None, None)
+            kernel_shape = (
+                self.num_kv_heads,
+                self.hidden_size,
+                num_q_heads_per_kv,
+                self.head_dim,
+            )
+            einsum_str = f"TD,{rhs_str}->KTGH"
+        elif envs.LAYOUT_Q_PROJ_AS_NDH:
             rhs_str = "NDH"
             q_proj_sharding = ("model", None, None)
             kernel_shape = (self.num_heads, self.hidden_size, self.head_dim)
+            einsum_str = f"TD,{rhs_str}->TNH"
         else:
             rhs_str = "DNH"
             q_proj_sharding = (None, "model", None)
             kernel_shape = (self.hidden_size, self.num_heads, self.head_dim)
+            einsum_str = f"TD,{rhs_str}->TNH"
 
         logger.info_once(
             f"Running with attention Q-Projection laid out as {rhs_str}")
 
         self.q_proj = JaxEinsum(
-            f"TD,{rhs_str}->TNH",
+            einsum_str,
             kernel_shape,
             dtype=dtype,
             param_dtype=dtype,
@@ -450,6 +463,11 @@ class Qwen3Attention(JaxModule):
         self._q_scale = 1.0
         self._k_scale = 1.0
         self._v_scale = 1.0
+        self.use_in_kernel_rope = (
+            getattr(config, "use_in_kernel_rope", False)
+            or envs.USE_STRIDED_IN_KERNEL_ROPE_RPA
+            or envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA
+        )
         self.kv_cache_quantized_dtype = None
         if kv_cache_dtype != "auto":
             self.kv_cache_quantized_dtype = utils.get_jax_dtype_from_str_dtype(
@@ -462,25 +480,30 @@ class Qwen3Attention(JaxModule):
         attention_metadata: AttentionMetadata,
     ) -> Tuple[jax.Array, jax.Array]:
         md = attention_metadata
-        # q: (T, N, H)
+        use_in_kernel_rope = (
+            self.use_in_kernel_rope
+            or envs.USE_STRIDED_IN_KERNEL_ROPE_RPA
+            or envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA
+        )
+
+        # q: (T, N, H) or (K, T, G, H)
         q = self.q_proj(x)
         q = self.q_norm(q)
-        q = apply_rope(q, md.input_positions, self.head_dim_original,
-                       self.rope_theta, self.rope_scaling)
 
         # k: (T, K, H)
         k = self.k_proj(x)
         k = self.k_norm(k)
-        k = apply_rope(k, md.input_positions, self.head_dim_original,
-                       self.rope_theta, self.rope_scaling)
 
         # v: (T, K, H)
         v = self.v_proj(x)
-        # o: (T, N, H)
+
         q_scale = k_scale = v_scale = None
+        if not use_in_kernel_rope:
+            q = apply_rope(q, md.input_positions, self.head_dim_original,
+                           self.rope_theta, self.rope_scaling)
+            k = apply_rope(k, md.input_positions, self.head_dim_original,
+                           self.rope_theta, self.rope_scaling)
         if self.kv_cache_quantized_dtype:
-            # TODO(kyuyeunk/jacobplatin): Enable w8a8 when VREG spill issue is resolved.
-            # q_scale = self._q_scale
             k_scale = self._k_scale
             v_scale = self._v_scale
             k, v = quantize_kv(self.kv_cache_quantized_dtype, k, v, k_scale,
@@ -497,13 +520,19 @@ class Qwen3Attention(JaxModule):
             q_scale=q_scale,
             k_scale=k_scale,
             v_scale=v_scale,
+            use_in_kernel_rope=use_in_kernel_rope,
+            rope_theta=self.rope_theta,
         )
+        if envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA:
+            outputs = outputs.swapaxes(0, 1).reshape(
+                x.shape[0], self.num_heads, self.head_dim
+            )
         # (T, D)
         if envs.USE_FUSED_ALL_REDUCE_MATMUL:
             if (
                 getattr(self, "disable_quant_stats_update", False)
-                or not hasattr(getattr(self.o_proj, "weight", None), "value")
-                or not isinstance(getattr(self.o_proj.weight, "value", self.o_proj.weight), _QWIX_TYPES)
+                
+                
             ):
                 return new_kv_cache, self.o_proj(outputs)
             outputs_2d = outputs.reshape((outputs.shape[0], -1))
@@ -598,8 +627,8 @@ class Qwen3MLP(JaxModule):
     def __call__(self, x: jax.Array) -> jax.Array:
         if (
             getattr(self, "disable_quant_stats_update", False)
-            or not hasattr(getattr(self.gate_proj, "weight", None), "value")
-            or not isinstance(getattr(self.gate_proj.weight, "value", self.gate_proj.weight), _QWIX_TYPES)
+            
+            
         ):
             gate = self.act_fn(self.gate_proj(x))
             up = self.up_proj(x)

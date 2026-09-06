@@ -17,23 +17,22 @@ import math
 from typing import Any, Callable, Optional, Tuple
 
 import jax
-import jax.numpy as jnp
 from jax.experimental.pallas.ops.tpu.paged_attention import paged_attention
 from jax.experimental.pallas.ops.tpu.splash_attention import \
     splash_attention_kernel as splash
 from jax.experimental.pallas.ops.tpu.splash_attention import \
     splash_attention_mask as mask_lib
+import jax.numpy as jnp
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 from jax.sharding import Sharding
-
-import tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from tpu_inference import envs
 from tpu_inference.kernels.flash_attention.kernel import (
     encoder_only_flash_attention, flash_attention)
 from tpu_inference.kernels.mla.v2.kernel import mla_ragged_paged_attention
 from tpu_inference.kernels.mla.v2.tuned_params import (TuningKey,
                                                        get_tuned_params)
+import tpu_inference.kernels.ragged_paged_attention.v3.kernel_hd64 as rpa_hd64
 from tpu_inference.layers.common.attention_metadata import (
     AttentionMetadata, SharedAttentionMetadata)
 from tpu_inference.layers.common.cp_attention import dcp_forward, pcp_forward
@@ -62,6 +61,18 @@ get_kv_cache_shape = rpa.get_kv_cache_shape
 
 ragged_paged_attention_hd64 = rpa_hd64.ragged_paged_attention_hd64
 get_kv_cache_shape_hd64 = rpa_hd64.get_kv_cache_shape
+
+try:
+  from google3.experimental.users.fangfangz.kernels.brpa_rope import configs as brpa_configs
+  from google3.experimental.users.fangfangz.kernels.brpa_rope.wrapper import ragged_paged_attention_rope
+except ImportError:
+  try:
+    from tpu_inference.kernels.experimental.brpa_rope import configs as brpa_configs
+    from tpu_inference.kernels.experimental.brpa_rope.wrapper import ragged_paged_attention_rope
+  except ImportError:
+    ragged_paged_attention_rope = None
+    brpa_configs = None
+
 
 
 def sharded_flash_attention(
@@ -387,82 +398,116 @@ def sharded_ragged_paged_attention(
     v_scale: float | None = None,
     update_kv_cache: bool = True,
     use_causal_mask: bool = True,
+    attn_logits_soft_cap: float | None = None,
+    use_in_kernel_rope: bool = False,
+    rope_theta: float = 1000000.0,
+    rope_dim: int | None = None,
+    rope_input_ordering: str = "split",
 ):
-    """Shards along KV heads."""
-    # Handle GQA/MQA where num_kv_heads < tp_size
-    # We replicate KV heads to match tp_size so that we can shard them evenly.
-    # TODO (ranlihao): This is not performant and introduces extra overhead during inference. We need to handle this during weight loading
-    tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
-    if tp_size > 1:
-        num_kv_heads = k.shape[1]
-        if num_kv_heads < tp_size:
-            if tp_size % num_kv_heads != 0:
-                raise ValueError(
+  """Shards along KV heads."""
+  # Handle GQA/MQA where num_kv_heads < tp_size
+  # We replicate KV heads to match tp_size so that we can shard them evenly.
+  # TODO (ranlihao): This is not performant and introduces extra overhead during inference. We need to handle this during weight loading
+  tp_size = get_mesh_shape_product(mesh, ShardingAxisName.ATTN_HEAD)
+  if tp_size > 1:
+    num_kv_heads = k.shape[1]
+    if num_kv_heads < tp_size:
+      if tp_size % num_kv_heads != 0:
+        raise ValueError(
                     f"For GQA/MQA, tp_size {tp_size} must be divisible by num_kv_heads {num_kv_heads}"
                 )
-            factor = tp_size // num_kv_heads
-            k = jnp.repeat(k, factor, axis=1)
-            v = jnp.repeat(v, factor, axis=1)
+      factor = tp_size // num_kv_heads
+      k = jnp.repeat(k, factor, axis=1)
+      v = jnp.repeat(v, factor, axis=1)
 
-    qkv_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None)
-    kv_cache_spec = P(ShardingAxisName.ATTN_DATA, None,
+  is_kv_group_major = envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA
+  use_strided_dma = envs.USE_STRIDED_IN_KERNEL_ROPE_RPA and not is_kv_group_major
+  use_in_kernel_rope_active = (
+      use_in_kernel_rope
+      or envs.USE_STRIDED_IN_KERNEL_ROPE_RPA
+      or envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA
+  )
+
+  if is_kv_group_major:
+    q_spec = P(ShardingAxisName.ATTN_HEAD, ShardingAxisName.ATTN_DATA, None, None)
+    out_q_spec = P(ShardingAxisName.ATTN_HEAD, ShardingAxisName.ATTN_DATA, None, None)
+  else:
+    q_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None)
+    out_q_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None)
+
+  kv_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None)
+  kv_cache_spec = P(ShardingAxisName.ATTN_DATA, None,
                       ShardingAxisName.ATTN_HEAD, None, None)
-    in_specs = (
-        qkv_spec,  # q
-        qkv_spec,  # k
-        qkv_spec,  # v
+  in_specs = (
+        q_spec,  # q
+        kv_spec,  # k
+        kv_spec,  # v
         kv_cache_spec,  # kv cache
         P(ShardingAxisName.ATTN_DATA),  # kv_lens
         P(ShardingAxisName.ATTN_DATA),  # page_indices
         P(ShardingAxisName.ATTN_DATA),  # cu_q_lens
         P(ShardingAxisName.ATTN_DATA),  # distribution
     )
-    out_specs = (qkv_spec, kv_cache_spec)
+  out_specs = (out_q_spec, kv_cache_spec)
 
-    args = (q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
+  args = (q, k, v, kv_cache, kv_lens, page_indices, cu_q_lens, distribution)
 
-    use_hd64 = q.shape[-1] == 64
+  use_hd64 = q.shape[-1] == 64
+  if use_in_kernel_rope_active and ragged_paged_attention_rope is not None:
+    func = ragged_paged_attention_rope
+  else:
     func = ragged_paged_attention_hd64 if use_hd64 else ragged_paged_attention
 
-    if attention_sink is not None:
-        if not use_hd64:
-            raise NotImplementedError(
+  if attention_sink is not None:
+    if not use_hd64:
+      raise NotImplementedError(
                 "Attention sink support is only available when head_dim==64")
 
-        in_specs += (P(ShardingAxisName.ATTN_HEAD), )
-        args += (attention_sink, )
+    in_specs += (P(ShardingAxisName.ATTN_HEAD), )
+    args += (attention_sink, )
 
-    # update_kv_cache=False (KV-share) is supported by the v3 default RPA
-    # kernel and by the experimental batched RPA kernel. The hd64 path
-    # doesn't accept it; fail loud rather than silently ignoring.
-    if use_hd64 and not update_kv_cache:
-        raise NotImplementedError(
+  # update_kv_cache=False (KV-share) is supported by the v3 default RPA
+  # kernel and by the experimental batched RPA kernel. The hd64 path
+  # doesn't accept it; fail loud rather than silently ignoring.
+  if use_hd64 and not update_kv_cache:
+    raise NotImplementedError(
             "update_kv_cache=False (KV-share) is not supported on the "
             "head_dim==64 RPA kernel.")
 
-    def _ragged_paged_attention(*args):
-        kwargs = dict(
-            sm_scale=sm_scale,
-            sliding_window=attention_chunk_size,
-            q_scale=q_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
+  def _ragged_paged_attention(*args):
+    kwargs = dict(
+        sm_scale=sm_scale,
+        sliding_window=attention_chunk_size,
+        soft_cap=attn_logits_soft_cap,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    if func is ragged_paged_attention_rope:
+      kwargs["rope_theta"] = rope_theta
+      kwargs["rope_dim"] = rope_dim
+      kwargs["rope_input_ordering"] = rope_input_ordering
+      kwargs["use_strided_dma"] = use_strided_dma
+      kwargs["is_kv_group_major"] = is_kv_group_major
+      if brpa_configs is not None:
+        kwargs["decode_block_sizes"] = brpa_configs.BlockSizes(
+            bq_sz=1, bq_c_sz=1, bkv_sz=256, batch_size=4, n_buffer=2
         )
-        # update_kv_cache is supported by both the v3 default and batched
-        # RPA kernels; only the hd64 path doesn't accept it. Default True
-        # is a no-op so we don't forward it to the hd64 signature.
-        if not use_hd64:
-            kwargs["update_kv_cache"] = update_kv_cache
-            kwargs["use_causal_mask"] = use_causal_mask
-        return func(*args, **kwargs)
+        kwargs["prefill_block_sizes"] = brpa_configs.BlockSizes(
+            bq_sz=256, bq_c_sz=256, bkv_sz=256, batch_size=1, n_buffer=3
+        )
+    elif not use_hd64:
+      kwargs["update_kv_cache"] = update_kv_cache
+      kwargs["use_causal_mask"] = use_causal_mask
+    return func(*args, **kwargs)
 
-    return jax.shard_map(
-        _ragged_paged_attention,
-        mesh=mesh,
-        in_specs=in_specs,
-        out_specs=out_specs,
-        check_vma=False,
-    )(*args)
+  return jax.shard_map(
+      _ragged_paged_attention,
+      mesh=mesh,
+      in_specs=in_specs,
+      out_specs=out_specs,
+      check_vma=False,
+  )(*args)
 
 
 def attention(
@@ -482,74 +527,60 @@ def attention(
     update_kv_cache: bool = True,
     use_causal_mask: bool = True,
     shared_attention_metadata: SharedAttentionMetadata | None = None,
+    attn_logits_soft_cap: float | None = None,
+    use_in_kernel_rope: bool = False,
+    rope_theta: float = 1000000.0,
+    rope_dim: int | None = None,
+    rope_input_ordering: str = "split",
 ) -> Tuple[jax.Array, jax.Array]:
-    # T: seq_len
-    # N: num_heads
-    # K: num_kv_heads
-    # D: hidden_size
-    # H: head_dim
-    # L: num_blocks
-    # S: block_size
+  # T: seq_len
+  # N: num_heads
+  # K: num_kv_heads
+  # D: hidden_size
+  # H: head_dim
+  # L: num_blocks
+  # S: block_size
 
-    # TODO(jevinjiang, cuiq): transpose q weight offline.
-    # q: (T, N, H)
-    # k,v: (T, K, H)
+  # TODO(jevinjiang, cuiq): transpose q weight offline.
+  # q: (T, N, H)
+  # k,v: (T, K, H)
 
-    if head_dim_original is None:
-        head_dim_original = q.shape[-1]
+  if head_dim_original is None:
+    head_dim_original = q.shape[-1]
 
-    if sm_scale is None:
-        sm_scale = head_dim_original**-0.5
+  if sm_scale is None:
+    sm_scale = head_dim_original**-0.5
 
-    md = attention_metadata
-    # shared_attention_metadata is None for flax models, and is used for vllm models to share the metadata across layers.
-    shared_md = shared_attention_metadata if shared_attention_metadata is not None else md
+  md = attention_metadata
+  # shared_attention_metadata is None for flax models, and is used for vllm models to share the metadata across layers.
+  shared_md = (
+      shared_attention_metadata if shared_attention_metadata is not None else md
+  )
 
-    if 'dcp' in mesh.shape and mesh.shape['dcp'] > 1:
-        return dcp_forward(
-            mesh,
-            q,
-            k,
-            v,
-            kv_cache,
-            md,
-            head_dim_original=head_dim_original,
-            sm_scale=sm_scale,
-            attention_chunk_size=attention_chunk_size,
-            q_scale=q_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
-        )
-    if 'pcp' in mesh.shape and mesh.shape['pcp'] > 1:
-        return pcp_forward(
-            mesh,
-            q,
-            k,
-            v,
-            kv_cache,
-            md,
-            sm_scale=sm_scale,
-            q_scale=q_scale,
-            k_scale=k_scale,
-            v_scale=v_scale,
-            update_kv_cache=update_kv_cache,
-            use_causal_mask=use_causal_mask,
-        )
-
-    # (T, N, H)
-    output, kv_cache = sharded_ragged_paged_attention(
+  if "dcp" in mesh.shape and mesh.shape["dcp"] > 1:
+    return dcp_forward(
         mesh,
         q,
         k,
         v,
         kv_cache,
-        shared_md.seq_lens,
-        md.block_tables,
-        shared_md.query_start_loc,
-        shared_md.request_distribution,
-        sinks,
+        md,
+        head_dim_original=head_dim_original,
         sm_scale=sm_scale,
         attention_chunk_size=attention_chunk_size,
+        q_scale=q_scale,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+  if 'pcp' in mesh.shape and mesh.shape['pcp'] > 1:
+    return pcp_forward(
+        mesh,
+        q,
+        k,
+        v,
+        kv_cache,
+        md,
+        sm_scale=sm_scale,
         q_scale=q_scale,
         k_scale=k_scale,
         v_scale=v_scale,
@@ -557,7 +588,33 @@ def attention(
         use_causal_mask=use_causal_mask,
     )
 
-    return kv_cache, output
+  # (T, N, H)
+  output, kv_cache = sharded_ragged_paged_attention(
+      mesh,
+      q,
+      k,
+      v,
+      kv_cache,
+      shared_md.seq_lens,
+      md.block_tables,
+      shared_md.query_start_loc,
+      shared_md.request_distribution,
+      sinks,
+      sm_scale=sm_scale,
+      attention_chunk_size=attention_chunk_size,
+      q_scale=q_scale,
+      k_scale=k_scale,
+      v_scale=v_scale,
+      update_kv_cache=update_kv_cache,
+      use_causal_mask=use_causal_mask,
+      attn_logits_soft_cap=attn_logits_soft_cap,
+      use_in_kernel_rope=use_in_kernel_rope,
+      rope_theta=rope_theta,
+      rope_dim=rope_dim,
+      rope_input_ordering=rope_input_ordering,
+  )
+
+  return kv_cache, output
 
 
 def mla_attention(

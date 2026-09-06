@@ -42,6 +42,8 @@ if TYPE_CHECKING:
     JAX_PROFILER_SERVER_PORT: int = 9999
     CONTINUE_DECODE_EOS_CHECK_INTERVAL: int = 1
     USE_BATCHED_RPA_KERNEL: bool = False
+    USE_STRIDED_IN_KERNEL_ROPE_RPA: bool = False
+    USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA: bool = False
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     # Optional operator override for the RPA v3 kernel block sizes, one per
     # case. Each is a comma-separated 4-tuple (bq_sz, bkv_sz, bq_csz, bkv_csz).
@@ -493,6 +495,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # when initializing large FP8 models on smaller RAM TPUs such as TPU8i.
     "VLLM_INCREMENTAL_FP8_LOADING":
     env_bool("VLLM_INCREMENTAL_FP8_LOADING", default=False),
+    "USE_STRIDED_IN_KERNEL_ROPE_RPA":
+    env_bool("USE_STRIDED_IN_KERNEL_ROPE_RPA", default=False),
+    "USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA":
+    env_bool("USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA", default=False),
     "USE_FUSED_ALL_REDUCE_MATMUL":
     env_bool("USE_FUSED_ALL_REDUCE_MATMUL", default=False),
     "FUSED_AR_PIPELINE_MODE":
