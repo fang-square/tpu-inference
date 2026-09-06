@@ -488,9 +488,28 @@ class Qwen3Attention(JaxModule):
 
         # q: (T, N, H) or (K, T, G, H)
         if envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA:
-            x_q = jnp.broadcast_to(
-                x[None, :, :], (self.num_kv_heads, x.shape[0], self.hidden_size)
-            )
+            if hasattr(x, "qvalue"):
+                x_qval = jnp.broadcast_to(
+                    x.qvalue[None, :, :], (self.num_kv_heads, x.shape[0], self.hidden_size)
+                )
+                x_scale = (
+                    jnp.broadcast_to(x.scale[None, :, :], (self.num_kv_heads, x.shape[0], 1))
+                    if x.scale is not None else None
+                )
+                x_q = QArray(qvalue=x_qval, scale=x_scale, qtype=x.qtype)
+            elif hasattr(x, "array") and hasattr(x.array, "qvalue"):
+                x_qval = jnp.broadcast_to(
+                    x.array.qvalue[None, :, :], (self.num_kv_heads, x.shape[0], self.hidden_size)
+                )
+                x_scale = (
+                    jnp.broadcast_to(x.array.scale[None, :, :], (self.num_kv_heads, x.shape[0], 1))
+                    if getattr(x.array, "scale", None) is not None else None
+                )
+                x_q = QArray(qvalue=x_qval, scale=x_scale, qtype=getattr(x.array, "qtype", None))
+            else:
+                x_q = jnp.broadcast_to(
+                    x[None, :, :], (self.num_kv_heads, x.shape[0], self.hidden_size)
+                )
             q = self.q_proj(x_q)
         else:
             q = self.q_proj(x)
@@ -498,7 +517,6 @@ class Qwen3Attention(JaxModule):
 
         # k: (T, K, H)
         k = self.k_proj(x)
-        k = self.k_norm(k)
         k = self.k_norm(k)
 
         # v: (T, K, H)
