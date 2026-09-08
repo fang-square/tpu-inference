@@ -375,16 +375,15 @@ class Qwen3Attention(JaxModule):
         self.additional_config = additional_config
 
         if envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA:
-            rhs_str = "KDGH"
+            rhs_str = "KDN"
             num_q_heads_per_kv = self.num_heads // self.num_kv_heads
-            q_proj_sharding = ("model", None, None, None)
+            q_proj_sharding = ("model", None, None)
             kernel_shape = (
                 self.num_kv_heads,
                 self.hidden_size,
-                num_q_heads_per_kv,
-                self.head_dim,
+                num_q_heads_per_kv * self.head_dim,
             )
-            einsum_str = f"KTD,{rhs_str}->KTGH"
+            einsum_str = f"KTD,{rhs_str}->KTN"
         elif envs.LAYOUT_Q_PROJ_AS_NDH:
             rhs_str = "NDH"
             q_proj_sharding = ("model", None, None)
@@ -511,6 +510,10 @@ class Qwen3Attention(JaxModule):
                     x[None, :, :], (self.num_kv_heads, x.shape[0], self.hidden_size)
                 )
             q = self.q_proj(x_q)
+            num_q_heads_per_kv = self.num_heads // self.num_kv_heads
+            q = q.reshape(
+                self.num_kv_heads, x.shape[0], num_q_heads_per_kv, self.head_dim
+            )
         else:
             q = self.q_proj(x)
         q = self.q_norm(q)

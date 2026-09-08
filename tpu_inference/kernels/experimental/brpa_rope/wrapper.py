@@ -54,24 +54,29 @@ def prepare_inputs(
 
   if is_kv_group_major:
     # Q is already (H_kv, T, G, D) -> No swapaxes needed! Zero HBM layout transpose!
-    o_hbm_alias_q_hbm = (
-        jnp.pad(
-            q,
-            (
-                (0, 0),
-                (0, 0),
-                (0, aligned_num_q_heads_per_kv_head - num_q_heads_per_kv_head),
-                (0, aligned_q_head_dim - actual_head_dim),
-            ),
-            constant_values=0,
-        )
-        .reshape(
-            actual_num_kv_heads,
-            total_q_tokens,
-            aligned_num_q_heads_per_kv_head // q_packing,
-            q_packing,
-            aligned_q_head_dim,
-        )
+    needs_pad = (
+        aligned_num_q_heads_per_kv_head != num_q_heads_per_kv_head
+        or aligned_q_head_dim != actual_head_dim
+    )
+    if needs_pad:
+      q_padded = jnp.pad(
+          q,
+          (
+              (0, 0),
+              (0, 0),
+              (0, aligned_num_q_heads_per_kv_head - num_q_heads_per_kv_head),
+              (0, aligned_q_head_dim - actual_head_dim),
+          ),
+          constant_values=0,
+      )
+    else:
+      q_padded = q
+    o_hbm_alias_q_hbm = q_padded.reshape(
+        actual_num_kv_heads,
+        total_q_tokens,
+        aligned_num_q_heads_per_kv_head // q_packing,
+        q_packing,
+        aligned_q_head_dim,
     )
   elif use_strided_dma:
     # Q is (T, H_kv, G, D) -> reshape/pad only, NO swapaxes! Strided DMA fetches per KV-head.
