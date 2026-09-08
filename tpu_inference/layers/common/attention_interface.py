@@ -420,12 +420,16 @@ def sharded_ragged_paged_attention(
       k = jnp.repeat(k, factor, axis=1)
       v = jnp.repeat(v, factor, axis=1)
 
-  is_kv_group_major = envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA
+  is_kv_group_major = (
+      envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA
+      or envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA
+  )
   use_strided_dma = envs.USE_STRIDED_IN_KERNEL_ROPE_RPA and not is_kv_group_major
   use_in_kernel_rope_active = (
       use_in_kernel_rope
       or envs.USE_STRIDED_IN_KERNEL_ROPE_RPA
       or envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA
+      or envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA
   )
 
   if is_kv_group_major:

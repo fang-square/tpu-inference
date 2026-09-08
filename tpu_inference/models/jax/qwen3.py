@@ -374,7 +374,7 @@ class Qwen3Attention(JaxModule):
         self.mesh = mesh
         self.additional_config = additional_config
 
-        if envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA:
+        if envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA or envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA:
             rhs_str = "KDN"
             num_q_heads_per_kv = self.num_heads // self.num_kv_heads
             q_proj_sharding = ("model", None, None)
@@ -418,36 +418,58 @@ class Qwen3Attention(JaxModule):
             quant_config=quant_config,
             prefix=prefix + ".q_norm",
         )
-        self.k_proj = JaxEinsum(
-            "TD,DKH->TKH",
-            (self.hidden_size, self.num_kv_heads, self.head_dim),
-            dtype=dtype,
-            param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(init_fn, (None, "model", None)),
-            rngs=rng,
-            quant_config=quant_config,
-            prefix=prefix + ".k_proj",
-        )
-        self.k_norm = JaxRmsNorm(
-            self.head_dim,
-            epsilon=self.rms_norm_eps,
-            dtype=dtype,
-            param_dtype=dtype,
-            scale_init=nnx.with_partitioning(init_fn, (None, )),
-            rngs=rng,
-            quant_config=quant_config,
-            prefix=prefix + ".k_norm",
-        )
-        self.v_proj = JaxEinsum(
-            "TD,DKH->TKH",
-            (self.hidden_size, self.num_kv_heads, self.head_dim),
-            dtype=dtype,
-            param_dtype=dtype,
-            kernel_init=nnx.with_partitioning(init_fn, (None, "model", None)),
-            rngs=rng,
-            quant_config=quant_config,
-            prefix=prefix + ".v_proj",
-        )
+        if envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA:
+            self.kv_proj = JaxEinsum(
+                "TD,DSKH->TSKH",
+                (self.hidden_size, 2, self.num_kv_heads, self.head_dim),
+                dtype=dtype,
+                param_dtype=dtype,
+                kernel_init=nnx.with_partitioning(init_fn, (None, None, "model", None)),
+                rngs=rng,
+                quant_config=quant_config,
+                prefix=prefix + ".kv_proj",
+            )
+            self.k_norm = JaxRmsNorm(
+                self.head_dim,
+                epsilon=self.rms_norm_eps,
+                dtype=dtype,
+                param_dtype=dtype,
+                scale_init=nnx.with_partitioning(init_fn, (None, )),
+                rngs=rng,
+                quant_config=quant_config,
+                prefix=prefix + ".k_norm",
+            )
+        else:
+            self.k_proj = JaxEinsum(
+                "TD,DKH->TKH",
+                (self.hidden_size, self.num_kv_heads, self.head_dim),
+                dtype=dtype,
+                param_dtype=dtype,
+                kernel_init=nnx.with_partitioning(init_fn, (None, "model", None)),
+                rngs=rng,
+                quant_config=quant_config,
+                prefix=prefix + ".k_proj",
+            )
+            self.k_norm = JaxRmsNorm(
+                self.head_dim,
+                epsilon=self.rms_norm_eps,
+                dtype=dtype,
+                param_dtype=dtype,
+                scale_init=nnx.with_partitioning(init_fn, (None, )),
+                rngs=rng,
+                quant_config=quant_config,
+                prefix=prefix + ".k_norm",
+            )
+            self.v_proj = JaxEinsum(
+                "TD,DKH->TKH",
+                (self.hidden_size, self.num_kv_heads, self.head_dim),
+                dtype=dtype,
+                param_dtype=dtype,
+                kernel_init=nnx.with_partitioning(init_fn, (None, "model", None)),
+                rngs=rng,
+                quant_config=quant_config,
+                prefix=prefix + ".v_proj",
+            )
         self.o_proj = JaxEinsum(
             "TNH,NHD->TD",
             (self.num_heads, self.head_dim, self.hidden_size),
@@ -466,6 +488,7 @@ class Qwen3Attention(JaxModule):
             getattr(config, "use_in_kernel_rope", False)
             or envs.USE_STRIDED_IN_KERNEL_ROPE_RPA
             or envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA
+            or envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA
         )
         self.kv_cache_quantized_dtype = None
         if kv_cache_dtype != "auto":
@@ -483,10 +506,11 @@ class Qwen3Attention(JaxModule):
             self.use_in_kernel_rope
             or envs.USE_STRIDED_IN_KERNEL_ROPE_RPA
             or envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA
+            or envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA
         )
 
         # q: (T, N, H) or (K, T, G, H)
-        if envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA:
+        if envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA or envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA:
             if hasattr(x, "qvalue"):
                 x_qval = jnp.broadcast_to(
                     x.qvalue[None, :, :], (self.num_kv_heads, x.shape[0], self.hidden_size)
@@ -518,12 +542,19 @@ class Qwen3Attention(JaxModule):
             q = self.q_proj(x)
         q = self.q_norm(q)
 
-        # k: (T, K, H)
-        k = self.k_proj(x)
-        k = self.k_norm(k)
+        # k, v projections
+        if envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA:
+            kv = self.kv_proj(x)
+            k_raw = kv[:, 0, :, :]
+            v = kv[:, 1, :, :]
+            k = self.k_norm(k_raw)
+        else:
+            # k: (T, K, H)
+            k = self.k_proj(x)
+            k = self.k_norm(k)
 
-        # v: (T, K, H)
-        v = self.v_proj(x)
+            # v: (T, K, H)
+            v = self.v_proj(x)
 
         q_scale = k_scale = v_scale = None
         if not use_in_kernel_rope:
@@ -551,7 +582,7 @@ class Qwen3Attention(JaxModule):
             use_in_kernel_rope=use_in_kernel_rope,
             rope_theta=self.rope_theta,
         )
-        if envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA:
+        if envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA or envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA:
             outputs = outputs.swapaxes(0, 1).reshape(
                 x.shape[0], self.num_heads, self.head_dim
             )
@@ -1021,6 +1052,16 @@ class Qwen3Model(Qwen2Model):
 
 
 class Qwen3ForCausalLM(JaxModule, LoadableWithIterator):
+    packed_modules_mapping = {
+        "kv_proj": [
+            "k_proj",
+            "v_proj",
+        ],
+        "gate_up_proj": [
+            "gate_proj",
+            "up_proj",
+        ],
+    }
 
     def __init__(self, vllm_config: VllmConfig, rng_key: jax.Array,
                  mesh: Mesh) -> None:
