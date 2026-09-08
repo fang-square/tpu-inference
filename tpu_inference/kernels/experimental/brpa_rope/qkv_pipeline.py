@@ -143,6 +143,44 @@ def permute_v_weight_to_kv_group_major(
   return jnp.transpose(w_3d, (1, 0, 2))
 
 
+def permute_joint_kv_weights(
+    w_k_baseline: jax.Array,
+    w_v_baseline: jax.Array,
+    num_kv_heads: int,
+    head_dim: int,
+) -> jax.Array:
+  """Combines K and V weights into a single joint W_KV weight tensor [H_in, 2 * N_kv * head_dim].
+
+  The output layout groups K (slice 0) and V (slice 1) along the KV slot dimension
+  such that a single GEMM with X [T, H_in] produces KV [T, 2, N_kv, head_dim].
+
+  Args:
+    w_k_baseline: Baseline K weight of shape [H_in, N_kv * head_dim].
+    w_v_baseline: Baseline V weight of shape [H_in, N_kv * head_dim].
+    num_kv_heads: Number of key/value heads.
+    head_dim: Dimension per attention head.
+
+  Returns:
+    w_kv_joint: Joint KV weight of shape [H_in, 2 * N_kv * head_dim].
+  """
+  hidden_dim, _ = w_k_baseline.shape
+  w_k_4d = w_k_baseline.reshape(hidden_dim, 1, num_kv_heads, head_dim)
+  w_v_4d = w_v_baseline.reshape(hidden_dim, 1, num_kv_heads, head_dim)
+  w_kv_4d = jnp.concatenate([w_k_4d, w_v_4d], axis=1)
+  return w_kv_4d.reshape(hidden_dim, 2 * num_kv_heads * head_dim)
+
+
+def quantize_joint_kv_weight_to_fp8(
+    w_kv_joint: jax.Array,
+    quant_max: float = FP8_MAX,
+    dtype: jnp.dtype = FP8_DTYPE,
+) -> tuple[jax.Array, jax.Array]:
+  """Per-channel static FP8 quantization for joint KV weight [H_in, 2 * N_kv * D]."""
+  return quantize_weight_to_fp8_static(
+      w_kv_joint, quant_max=quant_max, dtype=dtype, axis=0
+  )
+
+
 def permute_merged_qkv_weights(
     w_q_baseline: jax.Array,
     w_k_baseline: jax.Array,
@@ -413,3 +451,113 @@ def qkv_projection_pipeline_baseline(
     q_final = q_norm
 
   return q_final, k_final, v_final
+
+
+def qkv_projection_pipeline_head_major_q_joint_kv(
+    x_mid: jax.Array,
+    w_q_kv_major: jax.Array,
+    w_kv_joint: jax.Array,
+    scale_w_q: jax.Array,
+    scale_w_kv: jax.Array,
+    gamma_input: jax.Array,
+    gamma_q: jax.Array,
+    gamma_k: jax.Array,
+    num_kv_heads: int = 4,
+    head_dim: int = 128,
+    use_in_kernel_rope: bool = True,
+    theta: float = 1000000.0,
+    ordering: str = "split",
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+  """Decoupled Head-Major Q GEMM + Joint W_KV GEMM Pipeline.
+
+  1. Input RMSNorm + Dynamic FP8 Quantization:
+     x_mid [T, H_in] -> x_fp8 [T, H_in] (FP8), scale_x [T, 1] (BF16)
+
+  2. Dedicated Head-Major Q GEMM:
+     x_fp8 [T, H_in] x w_q [N_kv, H_in, G*D] -> q_dequant [N_kv, T, G*D] -> [N_kv, T, G, D]
+     Directly outputs head-major format [4, 4096, 8, 128], eliminating Step 11 layout copy!
+
+  3. Joint W_KV GEMM:
+     x_fp8 [T, H_in] x w_kv [H_in, 2*N_kv*D] -> kv_dequant [T, 2, N_kv, D]
+     Single joint GEMM for K and V, saving compute latency and intermediate memory copies.
+
+  4. Fused Vector Post-Processing:
+     - Head RMSNorm on Q [N_kv, T, G, D] (and RoPE if not in-kernel).
+     - Head RMSNorm on K slice [T, N_kv, D] (and RoPE if not in-kernel).
+     - V slice [T, N_kv, D] bypasses RoPE.
+     - Quantize K and V to FP8.
+     - Stack/format into joint KV cache tensor [T, 2, N_kv, D].
+
+  Args:
+    x_mid: Input residual activations [T, H_in] in BF16.
+    w_q_kv_major: Offline permuted Q weight [N_kv, H_in, G * D] in FP8.
+    w_kv_joint: Offline permuted joint KV weight [H_in, 2 * N_kv * D] in FP8.
+    scale_w_q: Static per-channel weight scales for Q [N_kv, 1, G * D] in BF16.
+    scale_w_kv: Static per-channel weight scales for KV [1, 2 * N_kv * D] in BF16.
+    gamma_input: Input RMSNorm scale parameters [H_in] in BF16.
+    gamma_q: Q Head RMSNorm scale parameters [D] in BF16.
+    gamma_k: K Head RMSNorm scale parameters [D] in BF16.
+    num_kv_heads: Number of key/value heads (e.g. 4 for TP=2 shard).
+    head_dim: Attention head dimension (e.g. 128).
+    use_in_kernel_rope: If True, defer RoPE to in-kernel RPAm computation.
+    theta: RoPE base frequency.
+    ordering: RoPE layout ('split' or 'interleaved').
+
+  Returns:
+    q_final: Head-major Query tensor [N_kv, T, G, D] in BF16.
+    k_final: Key tensor [T, N_kv, D] in FP8.
+    v_final: Value tensor [T, N_kv, D] in FP8.
+    kv_final: Joint Key/Value tensor [T, 2, N_kv, D] in FP8.
+  """
+  # Step 1-3: Input RMSNorm & Dynamic FP8 Quantization
+  x_norm = head_rms_norm(x_mid, gamma_input)
+  x_fp8, scale_x = quantize_to_fp8_dynamic(x_norm)
+
+  # Step 4: Head-Major Q GEMM
+  q_dequant = (
+      jnp.einsum(
+          "td,kdg->ktg",
+          x_fp8.astype(jnp.float32),
+          w_q_kv_major.astype(jnp.float32),
+      )
+      * scale_x.astype(jnp.float32)
+      * scale_w_q.astype(jnp.float32)
+  ).astype(jnp.bfloat16)
+
+  n_kv, total_tokens, gd = q_dequant.shape
+  g = gd // head_dim
+  q_4d = q_dequant.reshape(n_kv, total_tokens, g, head_dim)
+  q_norm = head_rms_norm(q_4d, gamma_q)
+  if not use_in_kernel_rope:
+    q_final = apply_reference_rope_5d(q_norm, theta=theta, ordering=ordering)
+  else:
+    q_final = q_norm
+
+  # Step 5: Joint W_KV GEMM
+  kv_dequant = (
+      jnp.dot(x_fp8.astype(jnp.float32), w_kv_joint.astype(jnp.float32))
+      * scale_x.astype(jnp.float32)
+      * scale_w_kv.astype(jnp.float32)
+  ).astype(jnp.bfloat16)
+  kv_4d = kv_dequant.reshape(total_tokens, 2, num_kv_heads, head_dim)
+
+  # Step 6: Vector Post-Processing on K and V
+  k_raw = kv_4d[:, 0, :, :]
+  v_raw = kv_4d[:, 1, :, :]
+
+  # RMSNorm on K only
+  k_norm = head_rms_norm(k_raw, gamma_k)
+  if not use_in_kernel_rope:
+    k_rot = apply_reference_rope_5d(k_norm, theta=theta, ordering=ordering)
+  else:
+    k_rot = k_norm
+  k_final = k_rot.astype(FP8_DTYPE)
+
+  # V bypasses RMSNorm and RoPE
+  v_final = v_raw.astype(FP8_DTYPE)
+
+  # Joint KV output tensor directly matching Paged KV Cache block layout
+  kv_final = jnp.stack([k_final, v_final], axis=1)
+
+  return q_final, k_final, v_final, kv_final
+
