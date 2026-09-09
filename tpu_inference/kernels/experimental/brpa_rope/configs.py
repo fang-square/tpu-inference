@@ -6,7 +6,10 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
-from . import utils
+try:
+  from google3.experimental.users.fangfangz.kernels.brpa_rope import utils
+except (ModuleNotFoundError, ImportError):
+  from . import utils
 
 
 @dataclasses.dataclass(frozen=True)
@@ -35,6 +38,11 @@ class ModelConfigs:
   rope_theta: float = 1000000.0
   rope_dim: int | None = None
   rope_ordering: str = "split"
+  apply_rmsnorm: bool = False
+  norm_eps: float = 1e-6
+  gamma_q: tuple[float, ...] | None = None
+  apply_k_rmsnorm: bool = False
+  gamma_k: tuple[float, ...] | None = None
 
   @property
   def num_q_heads_per_kv_head(self) -> int:
@@ -156,6 +164,7 @@ class ServingConfigs:
   scale_v: int | None = None
   kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE
   use_strided_dma: bool = False
+  is_kv_group_major: bool = False
   smem_fraction_limit_for_schedule_generation: float = 0.33
   max_schedule_size_multiplier: int = 16
 
@@ -308,7 +317,7 @@ class RpaConfigs:
       num_elements = self.model.num_kv_heads * 2 * self.aligned_kv_head_dim
     else:
       num_elements = self.aligned_num_kv_heads_x2 * self.aligned_kv_head_dim
-    return num_elements * jnp.dtype(self.serve.dtype_kv).itemsize
+    return num_elements * self.serve.dtype_kv.itemsize
 
   @property
   def q_bytes_per_token(self) -> int:
@@ -316,7 +325,7 @@ class RpaConfigs:
         self.model.num_kv_heads
         * self.aligned_num_q_heads_per_kv_head
         * self.aligned_q_head_dim
-        * jnp.dtype(self.serve.dtype_q).itemsize
+        * self.serve.dtype_q.itemsize
     )
 
   @property
@@ -325,7 +334,7 @@ class RpaConfigs:
         self.model.num_kv_heads
         * self.aligned_num_q_heads_per_kv_head
         * self.aligned_q_head_dim
-        * jnp.dtype(self.serve.dtype_out).itemsize
+        * self.serve.dtype_out.itemsize
     )
 
   @property

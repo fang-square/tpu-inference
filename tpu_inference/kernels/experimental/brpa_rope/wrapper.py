@@ -4,11 +4,15 @@ import jax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
+import numpy as np
 
-from . import configs
-from . import kernel
-from . import schedule
-from . import utils
+try:
+  from google3.experimental.users.fangfangz.kernels.brpa_rope import configs, kernel, schedule, utils
+except (ModuleNotFoundError, ImportError):
+  try:
+    from experimental.users.fangfangz.kernels.brpa_rope import configs, kernel, schedule, utils
+  except (ModuleNotFoundError, ImportError):
+    from tpu_inference.kernels.experimental.brpa_rope import configs, kernel, schedule, utils
 
 
 def prepare_inputs(
@@ -23,13 +27,20 @@ def prepare_inputs(
 ) -> tuple[jax.Array, jax.Array]:
   """Prepares Q and K/V tensors for the RPAm kernel.
 
-  - is_kv_group_major=True: q has shape [N_kv, T, G, D] (offline permuted Q-weight GEMM).
-  - use_strided_dma=True: q has shape [T, H_q, D] and is transferred into VMEM via
+  - is_kv_group_major=True: q has shape [N_kv, T, G, D] (offline permuted
+  Q-weight GEMM).
+  - use_strided_dma=True: q has shape [T, H_q, D] and is transferred into VMEM
+  via
     strided DMA per KV head group without swapaxes.
   - Standard path: q has shape [T, H_q, D] and is transposed via swapaxes(0, 1).
   """
   if is_kv_group_major:
-    actual_num_kv_heads, total_q_tokens, num_q_heads_per_kv_head, actual_head_dim = q.shape
+    (
+        actual_num_kv_heads,
+        total_q_tokens,
+        num_q_heads_per_kv_head,
+        actual_head_dim,
+    ) = q.shape
     actual_num_q_heads = actual_num_kv_heads * num_q_heads_per_kv_head
   else:
     total_q_tokens, actual_num_q_heads, actual_head_dim = q.shape
@@ -54,24 +65,16 @@ def prepare_inputs(
 
   if is_kv_group_major:
     # Q is already (H_kv, T, G, D) -> No swapaxes needed! Zero HBM layout transpose!
-    needs_pad = (
-        aligned_num_q_heads_per_kv_head != num_q_heads_per_kv_head
-        or aligned_q_head_dim != actual_head_dim
-    )
-    if needs_pad:
-      q_padded = jnp.pad(
-          q,
-          (
-              (0, 0),
-              (0, 0),
-              (0, aligned_num_q_heads_per_kv_head - num_q_heads_per_kv_head),
-              (0, aligned_q_head_dim - actual_head_dim),
-          ),
-          constant_values=0,
-      )
-    else:
-      q_padded = q
-    o_hbm_alias_q_hbm = q_padded.reshape(
+    o_hbm_alias_q_hbm = jnp.pad(
+        q,
+        (
+            (0, 0),
+            (0, 0),
+            (0, aligned_num_q_heads_per_kv_head - num_q_heads_per_kv_head),
+            (0, aligned_q_head_dim - actual_head_dim),
+        ),
+        constant_values=0,
+    ).reshape(
         actual_num_kv_heads,
         total_q_tokens,
         aligned_num_q_heads_per_kv_head // q_packing,
@@ -80,29 +83,26 @@ def prepare_inputs(
     )
   elif use_strided_dma:
     # Q is (T, H_kv, G, D) -> reshape/pad only, NO swapaxes! Strided DMA fetches per KV-head.
-    o_hbm_alias_q_hbm = (
-        jnp.pad(
-            q.reshape(
-                total_q_tokens,
-                actual_num_kv_heads,
-                num_q_heads_per_kv_head,
-                actual_head_dim,
-            ),
-            (
-                (0, 0),
-                (0, 0),
-                (0, aligned_num_q_heads_per_kv_head - num_q_heads_per_kv_head),
-                (0, aligned_q_head_dim - actual_head_dim),
-            ),
-            constant_values=0,
-        )
-        .reshape(
+    o_hbm_alias_q_hbm = jnp.pad(
+        q.reshape(
             total_q_tokens,
             actual_num_kv_heads,
-            aligned_num_q_heads_per_kv_head // q_packing,
-            q_packing,
-            aligned_q_head_dim,
-        )
+            num_q_heads_per_kv_head,
+            actual_head_dim,
+        ),
+        (
+            (0, 0),
+            (0, 0),
+            (0, aligned_num_q_heads_per_kv_head - num_q_heads_per_kv_head),
+            (0, aligned_q_head_dim - actual_head_dim),
+        ),
+        constant_values=0,
+    ).reshape(
+        total_q_tokens,
+        actual_num_kv_heads,
+        aligned_num_q_heads_per_kv_head // q_packing,
+        q_packing,
+        aligned_q_head_dim,
     )
   else:
     # Standard path: queries (T, H, D) -> (T, H_kv, G, D) -> swapaxes(0, 1) -> (H_kv, T, G, D)
@@ -443,6 +443,11 @@ def calculate_block_sizes(
         "rope_ordering",
         "is_kv_group_major",
         "use_strided_dma",
+        "apply_rmsnorm",
+        "norm_eps",
+        "gamma_q",
+        "apply_k_rmsnorm",
+        "gamma_k",
     ),
     donate_argnames=("queries", "keys", "values"),
 )
@@ -478,12 +483,18 @@ def ragged_paged_attention(
     rope_ordering: str = "split",
     is_kv_group_major: bool = False,
     use_strided_dma: bool = False,
+    apply_rmsnorm: bool = False,
+    norm_eps: float = 1e-6,
+    gamma_q: jax.Array | tuple[float, ...] | None = None,
+    apply_k_rmsnorm: bool = False,
+    gamma_k: jax.Array | tuple[float, ...] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
   """Perform batched ragged paged attention.
 
   Args:
-    queries: [max_num_tokens, num_q_heads, head_dim] or [num_kv_heads, max_num_tokens, num_q_heads_per_kv_group, head_dim]
-      if is_kv_group_major=True.
+    queries: [max_num_tokens, num_q_heads, head_dim] or [num_kv_heads,
+      max_num_tokens, num_q_heads_per_kv_group, head_dim] if
+      is_kv_group_major=True.
     keys: [max_num_tokens, num_kv_heads, head_dim].
     values: [max_num_tokens, num_kv_heads, head_dim].
     kv_cache: [num_pages, page_size, cdiv(num_kv_heads * 2, kv_packing),
@@ -515,9 +526,11 @@ def ragged_paged_attention(
     debug_mode: Not used.
     out_dtype: Dtype of output. Defaults to dtype of queries.
     use_causal_mask: Not used.
-    is_kv_group_major: If True, queries tensor is already grouped by KV head [H_kv, T, G, D].
-    use_strided_dma: If True, queries tensor is token-major [T, H_q, D] and fetched
-      directly into VMEM via in-kernel strided DMA without HBM swapaxes transposition.
+    is_kv_group_major: If True, queries tensor is already grouped by KV head
+      [H_kv, T, G, D].
+    use_strided_dma: If True, queries tensor is token-major [T, H_q, D] and
+      fetched directly into VMEM via in-kernel strided DMA without HBM swapaxes
+      transposition.
 
   Returns:
     out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -560,6 +573,12 @@ def ragged_paged_attention(
 
   num_page_indices = page_indices.shape[0]
 
+  gamma_q_tuple = (
+      tuple(float(x) for x in gamma_q) if gamma_q is not None else None
+  )
+  gamma_k_tuple = (
+      tuple(float(x) for x in gamma_k) if gamma_k is not None else None
+  )
   model_cfgs = configs.ModelConfigs(
       num_q_heads=num_q_heads,
       num_kv_heads=num_kv_heads,
@@ -572,6 +591,11 @@ def ragged_paged_attention(
       rope_theta=rope_theta,
       rope_dim=rope_dim,
       rope_ordering=rope_ordering,
+      apply_rmsnorm=apply_rmsnorm,
+      norm_eps=norm_eps,
+      gamma_q=gamma_q_tuple,
+      apply_k_rmsnorm=apply_k_rmsnorm,
+      gamma_k=gamma_k_tuple,
   )
   serve_cfgs = configs.ServingConfigs(
       num_seqs=max_num_seqs,
@@ -586,6 +610,7 @@ def ragged_paged_attention(
       scale_v=v_scale,
       kv_layout=kv_layout,
       use_strided_dma=use_strided_dma,
+      is_kv_group_major=is_kv_group_major,
   )
 
   q_hbm, new_kv_hbm = prepare_inputs(
@@ -661,7 +686,7 @@ def ragged_paged_attention(
   # slice back to original shape if padded
   num_q_heads_per_kv_head = num_q_heads // num_kv_heads
   o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
-  if use_strided_dma:
+  if use_strided_dma and not is_kv_group_major:
     # o_hbm is [T, H_kv, G, D] -> reshape directly to [T, H_q, D] (zero copy)
     o_hbm = o_hbm.reshape(total_q_tokens, num_q_heads, head_dim)
   elif not is_kv_group_major:
@@ -696,6 +721,11 @@ def ragged_paged_attention_rope(
     kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
     is_kv_group_major: bool = False,
     use_strided_dma: bool = False,
+    apply_rmsnorm: bool = False,
+    norm_eps: float = 1e-6,
+    gamma_q: jax.Array | tuple[float, ...] | None = None,
+    apply_k_rmsnorm: bool = False,
+    gamma_k: jax.Array | tuple[float, ...] | None = None,
 ) -> tuple[jax.Array, jax.Array]:
   """Wrapper for bRPA with in-kernel RoPE enabled."""
   return ragged_paged_attention(
@@ -725,4 +755,9 @@ def ragged_paged_attention_rope(
       rope_ordering=rope_input_ordering,
       is_kv_group_major=is_kv_group_major,
       use_strided_dma=use_strided_dma,
+      apply_rmsnorm=apply_rmsnorm,
+      norm_eps=norm_eps,
+      gamma_q=gamma_q,
+      apply_k_rmsnorm=apply_k_rmsnorm,
+      gamma_k=gamma_k,
   )

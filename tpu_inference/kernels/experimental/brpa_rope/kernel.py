@@ -7,12 +7,13 @@ import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 
-from . import bref_override
-from . import configs
-from . import flash_attention
-from . import schedule
-from . import stitch_utils
-from . import utils
+try:
+  from google3.experimental.users.fangfangz.kernels.brpa_rope import bref_override, configs, flash_attention, schedule, stitch_utils, utils
+except (ModuleNotFoundError, ImportError):
+  try:
+    from experimental.users.fangfangz.kernels.brpa_rope import bref_override, configs, flash_attention, schedule, stitch_utils, utils
+  except (ModuleNotFoundError, ImportError):
+    from tpu_inference.kernels.experimental.brpa_rope import bref_override, configs, flash_attention, schedule, stitch_utils, utils
 
 
 def apply_in_kernel_rope(
@@ -273,6 +274,15 @@ def rpa_body(
   if cfgs.aligned_q_head_dim != cfgs.aligned_kv_head_dim:
     q = q[..., : cfgs.aligned_kv_head_dim]
 
+  if cfgs.model.apply_rmsnorm:
+    q_f32 = q.astype(jnp.float32)
+    variance_q = jnp.mean(jnp.square(q_f32), axis=-1, keepdims=True)
+    q_normed = q_f32 * lax.rsqrt(variance_q + cfgs.model.norm_eps)
+    if cfgs.model.gamma_q is not None:
+      gamma_q = jnp.array(cfgs.model.gamma_q, dtype=jnp.float32)
+      q_normed = q_normed * gamma_q
+    q = q_normed.astype(q.dtype)
+
   if cfgs.model.apply_rope:
     tok_iota_q = lax.broadcasted_iota(cfgs.serve.int_ty, (1, cfgs.bq_sz), 1)
     positions_q = jnp.stack(processed_q_len, axis=0)[:, None] + tok_iota_q
@@ -366,6 +376,15 @@ def rpa_body(
   # Stack to (batch, num_heads, bkv_sz, num_lanes)
   k = jnp.stack(k_b, axis=0)
   v = jnp.stack(v_b, axis=0)
+
+  if cfgs.model.apply_k_rmsnorm:
+    k_f32 = k.astype(jnp.float32)
+    variance_k = jnp.mean(jnp.square(k_f32), axis=-1, keepdims=True)
+    k_normed = k_f32 * lax.rsqrt(variance_k + cfgs.model.norm_eps)
+    if cfgs.model.gamma_k is not None:
+      gamma_k = jnp.array(cfgs.model.gamma_k, dtype=jnp.float32)
+      k_normed = k_normed * gamma_k
+    k = k_normed.astype(k.dtype)
 
   if cfgs.model.apply_rope:
     tok_iota_k = lax.broadcasted_iota(cfgs.serve.int_ty, (1, cfgs.bkv_sz), 1)

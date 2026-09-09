@@ -8,8 +8,10 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
 
-from . import configs
-from . import utils
+try:
+  from google3.experimental.users.fangfangz.kernels.brpa_rope import configs, utils
+except (ModuleNotFoundError, ImportError):
+  from . import configs, utils
 
 
 class FieldOffset:

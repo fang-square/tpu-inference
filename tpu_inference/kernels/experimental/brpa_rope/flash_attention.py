@@ -2,8 +2,10 @@ import jax
 from jax import lax
 import jax.numpy as jnp
 
-from . import configs
-from . import utils
+try:
+  from google3.experimental.users.fangfangz.kernels.brpa_rope import configs, utils
+except (ModuleNotFoundError, ImportError):
+  from . import configs, utils
 
 
 def flash_attention_qk_softmax(

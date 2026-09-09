@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     USE_STRIDED_IN_KERNEL_ROPE_RPA: bool = False
     USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA: bool = False
     USE_HEAD_MAJOR_Q_JOINT_KV_RPA: bool = False
+    USE_PALLAS_2D_RMSNORM: bool = True
     USE_BATCHED_RPA_SEQ_ON_LANE: bool = False
     # Optional operator override for the RPA v3 kernel block sizes, one per
     # case. Each is a comma-separated 4-tuple (bq_sz, bkv_sz, bq_csz, bkv_csz).
@@ -502,6 +503,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     env_bool("USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA", default=False),
     "USE_HEAD_MAJOR_Q_JOINT_KV_RPA":
     env_bool("USE_HEAD_MAJOR_Q_JOINT_KV_RPA", default=False),
+    "USE_PALLAS_2D_RMSNORM":
+    env_bool("USE_PALLAS_2D_RMSNORM", default=True),
     "USE_FUSED_ALL_REDUCE_MATMUL":
     env_bool("USE_FUSED_ALL_REDUCE_MATMUL", default=False),
     "FUSED_AR_PIPELINE_MODE":

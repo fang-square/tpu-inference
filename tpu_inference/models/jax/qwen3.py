@@ -33,6 +33,17 @@ from tpu_inference.kernels.fused_rmsnorm_quant.fused_rmsnorm_fp8 import (
 from tpu_inference.kernels.swiglu.fused_swiglu_pallas import (
     fused_swiglu_pallas,
 )
+try:
+    from tpu_inference.kernels.experimental.brpa_rope.pallas_rmsnorm import (
+        pallas_2d_rmsnorm,
+    )
+except ImportError:
+    try:
+        from google3.experimental.users.fangfangz.kernels.brpa_rope.pallas_rmsnorm import (
+            pallas_2d_rmsnorm,
+        )
+    except ImportError:
+        pallas_2d_rmsnorm = None
 from tpu_inference.layers.common.attention_interface import attention
 from tpu_inference.layers.common.attention_metadata import AttentionMetadata
 from tpu_inference.layers.common.quantization import quantize_kv
@@ -143,6 +154,56 @@ def _apply_fused_rmsnorm_fp8(
             )(x, gamma)
 
     return _call_kernel(x, gamma, residual)
+
+
+def _apply_pallas_2d_rmsnorm(
+    q: jax.Array,
+    gamma: jax.Array,
+    mesh: Mesh | None = None,
+    eps: float = 1e-6,
+) -> jax.Array:
+    """Applies dedicated 2D Pallas RMSNorm kernel to head-major Q tensor.
+
+    Args:
+        q: [num_kv_heads, total_tokens, g, head_dim] sharded along num_kv_heads on 'model'.
+        gamma: [head_dim]
+        mesh: JAX device mesh.
+        eps: RMSNorm epsilon.
+
+    Returns:
+        Normalized Q tensor of shape [num_kv_heads, total_tokens, g, head_dim].
+    """
+    if pallas_2d_rmsnorm is None:
+        n_kv, total_tokens, g, head_dim = q.shape
+        q_3d = q.reshape(n_kv, total_tokens * g, head_dim)
+        var = jnp.mean(jnp.square(q_3d.astype(jnp.float32)), axis=-1, keepdims=True)
+        q_norm = (q_3d.astype(jnp.float32) * jax.lax.rsqrt(var + eps)) * gamma.astype(jnp.float32)
+        return q_norm.astype(q.dtype).reshape(n_kv, total_tokens, g, head_dim)
+
+    def _call_norm(q_loc, gamma_loc):
+        return pallas_2d_rmsnorm(q_loc, gamma_loc, eps=eps)
+
+    if (
+        mesh is not None
+        and len(mesh.devices.shape) > 0
+        and mesh.devices.size > 1
+        and "model" in mesh.axis_names
+        and mesh.shape["model"] > 1
+    ):
+        in_specs = (
+            jax.sharding.PartitionSpec("model", None, None, None),
+            jax.sharding.PartitionSpec(),
+        )
+        out_specs = jax.sharding.PartitionSpec("model", None, None, None)
+        return jax.shard_map(
+            _call_norm,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_vma=False,
+        )(q, gamma)
+    else:
+        return _call_norm(q, gamma)
 
 
 def _apply_fused_swiglu(
@@ -420,11 +481,11 @@ class Qwen3Attention(JaxModule):
         )
         if envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA:
             self.kv_proj = JaxEinsum(
-                "TD,DSKH->TSKH",
-                (self.hidden_size, 2, self.num_kv_heads, self.head_dim),
+                "TD,DH->TH",
+                (self.hidden_size, 2 * self.num_kv_heads * self.head_dim),
                 dtype=dtype,
                 param_dtype=dtype,
-                kernel_init=nnx.with_partitioning(init_fn, (None, None, "model", None)),
+                kernel_init=nnx.with_partitioning(init_fn, (None, "model")),
                 rngs=rng,
                 quant_config=quant_config,
                 prefix=prefix + ".kv_proj",
@@ -534,20 +595,34 @@ class Qwen3Attention(JaxModule):
                     x[None, :, :], (self.num_kv_heads, x.shape[0], self.hidden_size)
                 )
             q = self.q_proj(x_q)
-            num_q_heads_per_kv = self.num_heads // self.num_kv_heads
-            q = q.reshape(
-                self.num_kv_heads, x.shape[0], num_q_heads_per_kv, self.head_dim
-            )
+            n_kv, total_tokens, gd = q.shape
+            g = gd // self.head_dim
+            q_4d = q.reshape(n_kv, total_tokens, g, self.head_dim)
+            gamma_q = getattr(self.q_norm.weight, "value", self.q_norm.weight)
+            if envs.USE_PALLAS_2D_RMSNORM:
+                q = _apply_pallas_2d_rmsnorm(
+                    q_4d,
+                    gamma_q,
+                    mesh=self.mesh,
+                    eps=self.rms_norm_eps,
+                )
+            else:
+                q_3d = q_4d.reshape(n_kv, total_tokens * g, self.head_dim)
+                q_norm_3d = self.q_norm(q_3d)
+                q = q_norm_3d.reshape(n_kv, total_tokens, g, self.head_dim)
         else:
             q = self.q_proj(x)
-        q = self.q_norm(q)
+            q = self.q_norm(q)
 
         # k, v projections
         if envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA:
             kv = self.kv_proj(x)
+            kv = kv.reshape(x.shape[0], 2, self.num_kv_heads, self.head_dim)
             k_raw = kv[:, 0, :, :]
             v = kv[:, 1, :, :]
-            k = self.k_norm(k_raw)
+            k_shape = k_raw.shape
+            k_norm_flat = self.k_norm(k_raw.reshape((-1, self.head_dim)))
+            k = k_norm_flat.reshape(k_shape)
         else:
             # k: (T, K, H)
             k = self.k_proj(x)

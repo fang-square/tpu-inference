@@ -75,11 +75,18 @@ def main(argv):
   del argv
   client = xprof_analysis_client.XprofAnalysisClient("fangfangz")
   sessions = {
-      "1_No_RoPE": "platforms-deepsea-11979495184690623545",
-      "2_Baseline_Standalone_RoPE": "platforms-deepsea-11979495184690624487",
-      "3_Fused_Token_Major": "platforms-deepsea-11979495184690625272",
-      "4_Strided_DMA": "platforms-deepsea-11979495184690626057",
-      "5_KV_Group_Major": "platforms-deepsea-11979495184690622746",
+      "0_Decoupled_Ref": "platforms-deepsea-16584335618764035432",
+      "1_KV_Major_InKernelNormRoPE": "platforms-deepsea-16584335618764037346",
+      "2_TokenMajor_FusedNorm_StridedDMA": (
+          "platforms-deepsea-16584335618764034845"
+      ),
+      "3_KV_Major_StridedDMA_InKernelNorm": (
+          "platforms-deepsea-16584335618764036440"
+      ),
+      "3b_TokenMajor_StridedDMA_InKernelNorm": (
+          "platforms-deepsea-16584335618764038035"
+      ),
+      "4_KV_Major_2D_Pallas_Norm": "platforms-deepsea-1181391949813709243",
   }
   for label, sid in sessions.items():
     try:

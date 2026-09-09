@@ -22,8 +22,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from . import configs
-from . import wrapper
+try:
+  from google3.experimental.users.fangfangz.kernels.brpa_rope import configs, pallas_rmsnorm, wrapper
+except (ModuleNotFoundError, ImportError):
+  try:
+    from experimental.users.fangfangz.kernels.brpa_rope import configs, pallas_rmsnorm, wrapper
+  except (ModuleNotFoundError, ImportError):
+    from tpu_inference.kernels.experimental.brpa_rope import configs, pallas_rmsnorm, wrapper
 
 FP8_DTYPE = jnp.float8_e4m3fn
 FP8_MAX = 448.0
@@ -330,8 +335,13 @@ def qkv_projection_pipeline_kv_group_major(
 
   n_kv, total_tokens, gd = q_dequant.shape
   g = gd // head_dim
-  q_4d = q_dequant.reshape(n_kv, total_tokens, g, head_dim)
-  q_norm = head_rms_norm(q_4d, gamma_q)
+  # Reshape inner contiguous dimensions (T * G) to 3D without touching n_kv.
+  # This guarantees a single unified vector reduction kernel in XLA while
+  # preserving n_kv as the device-sharded mesh dimension and maintaining 100%
+  # KV-head major zero-copy compatibility for RPAm.
+  q_3d = q_dequant.reshape(n_kv, total_tokens * g, head_dim)
+  q_norm = head_rms_norm(q_3d, gamma_q)
+  q_norm = q_norm.reshape(n_kv, total_tokens, g, head_dim)
   if not use_in_kernel_rope:
     q_final = apply_reference_rope_5d(q_norm, theta=theta, ordering=ordering)
   else:
@@ -369,12 +379,13 @@ def qkv_projection_pipeline_merged(
   total_heads = total_m // head_dim
   g = total_heads - 2
 
-  q_raw = qkv_dequant[:, :, : g * head_dim].reshape(n_kv, total_tokens, g, head_dim)
+  q_slice = qkv_dequant[:, :, : g * head_dim]
   k_raw = qkv_dequant[:, :, g * head_dim : (g + 1) * head_dim].reshape(n_kv, total_tokens, head_dim)
   v_raw = qkv_dequant[:, :, (g + 1) * head_dim :].reshape(n_kv, total_tokens, head_dim)
 
-  # Head RMSNorms
-  q_norm = head_rms_norm(q_raw, gamma_q)
+  q_3d = q_slice.reshape(n_kv, total_tokens * g, head_dim)
+  q_norm = head_rms_norm(q_3d, gamma_q)
+  q_norm = q_norm.reshape(n_kv, total_tokens, g, head_dim)
   if not use_in_kernel_rope:
     q_final = apply_reference_rope_5d(q_norm, theta=theta, ordering=ordering)
   else:
@@ -464,6 +475,8 @@ def qkv_projection_pipeline_head_major_q_joint_kv(
     gamma_k: jax.Array,
     num_kv_heads: int = 4,
     head_dim: int = 128,
+    use_in_kernel_norm: bool = False,
+    use_pallas_2d_norm: bool = False,
     use_in_kernel_rope: bool = True,
     theta: float = 1000000.0,
     ordering: str = "split",
@@ -474,40 +487,23 @@ def qkv_projection_pipeline_head_major_q_joint_kv(
      x_mid [T, H_in] -> x_fp8 [T, H_in] (FP8), scale_x [T, 1] (BF16)
 
   2. Dedicated Head-Major Q GEMM:
-     x_fp8 [T, H_in] x w_q [N_kv, H_in, G*D] -> q_dequant [N_kv, T, G*D] -> [N_kv, T, G, D]
-     Directly outputs head-major format [4, 4096, 8, 128], eliminating Step 11 layout copy!
+     x_fp8 [T, H_in] x w_q [N_kv, H_in, G*D] -> q_dequant [N_kv, T, G*D] ->
+     [N_kv, T, G, D]
+     Directly outputs head-major format [4, 4096, 8, 128], eliminating Step 11
+     layout copy!
 
   3. Joint W_KV GEMM:
      x_fp8 [T, H_in] x w_kv [H_in, 2*N_kv*D] -> kv_dequant [T, 2, N_kv, D]
-     Single joint GEMM for K and V, saving compute latency and intermediate memory copies.
+     Single joint GEMM for K and V, saving compute latency and intermediate
+     memory copies.
 
   4. Fused Vector Post-Processing:
-     - Head RMSNorm on Q [N_kv, T, G, D] (and RoPE if not in-kernel).
+     - Head RMSNorm on Q [N_kv, T, G, D] via XLA, In-Kernel RPAm, or Dedicated
+     2D Pallas kernel.
      - Head RMSNorm on K slice [T, N_kv, D] (and RoPE if not in-kernel).
      - V slice [T, N_kv, D] bypasses RoPE.
      - Quantize K and V to FP8.
      - Stack/format into joint KV cache tensor [T, 2, N_kv, D].
-
-  Args:
-    x_mid: Input residual activations [T, H_in] in BF16.
-    w_q_kv_major: Offline permuted Q weight [N_kv, H_in, G * D] in FP8.
-    w_kv_joint: Offline permuted joint KV weight [H_in, 2 * N_kv * D] in FP8.
-    scale_w_q: Static per-channel weight scales for Q [N_kv, 1, G * D] in BF16.
-    scale_w_kv: Static per-channel weight scales for KV [1, 2 * N_kv * D] in BF16.
-    gamma_input: Input RMSNorm scale parameters [H_in] in BF16.
-    gamma_q: Q Head RMSNorm scale parameters [D] in BF16.
-    gamma_k: K Head RMSNorm scale parameters [D] in BF16.
-    num_kv_heads: Number of key/value heads (e.g. 4 for TP=2 shard).
-    head_dim: Attention head dimension (e.g. 128).
-    use_in_kernel_rope: If True, defer RoPE to in-kernel RPAm computation.
-    theta: RoPE base frequency.
-    ordering: RoPE layout ('split' or 'interleaved').
-
-  Returns:
-    q_final: Head-major Query tensor [N_kv, T, G, D] in BF16.
-    k_final: Key tensor [T, N_kv, D] in FP8.
-    v_final: Value tensor [T, N_kv, D] in FP8.
-    kv_final: Joint Key/Value tensor [T, 2, N_kv, D] in FP8.
   """
   # Step 1-3: Input RMSNorm & Dynamic FP8 Quantization
   x_norm = head_rms_norm(x_mid, gamma_input)
@@ -526,9 +522,20 @@ def qkv_projection_pipeline_head_major_q_joint_kv(
 
   n_kv, total_tokens, gd = q_dequant.shape
   g = gd // head_dim
-  q_4d = q_dequant.reshape(n_kv, total_tokens, g, head_dim)
-  q_norm = head_rms_norm(q_4d, gamma_q)
-  if not use_in_kernel_rope:
+
+  if use_pallas_2d_norm:
+    # Dedicated 2D Pallas RMSNorm kernel streaming [N, 128] through VMEM
+    q_4d = q_dequant.reshape(n_kv, total_tokens, g, head_dim)
+    q_norm = pallas_rmsnorm.pallas_2d_rmsnorm(q_4d, gamma_q)
+  elif not use_in_kernel_norm:
+    # Reshape inner contiguous dimensions (T * G) to 3D without touching n_kv.
+    q_3d = q_dequant.reshape(n_kv, total_tokens * g, head_dim)
+    q_norm = head_rms_norm(q_3d, gamma_q)
+    q_norm = q_norm.reshape(n_kv, total_tokens, g, head_dim)
+  else:
+    q_norm = q_dequant.reshape(n_kv, total_tokens, g, head_dim)
+
+  if not use_in_kernel_rope and not use_in_kernel_norm:
     q_final = apply_reference_rope_5d(q_norm, theta=theta, ordering=ordering)
   else:
     q_final = q_norm
@@ -561,3 +568,93 @@ def qkv_projection_pipeline_head_major_q_joint_kv(
 
   return q_final, k_final, v_final, kv_final
 
+
+def qkv_projection_pipeline_token_major_joint_kv(
+    x_mid: jax.Array,
+    w_q_base: jax.Array,
+    w_kv_joint: jax.Array,
+    scale_w_q: jax.Array,
+    scale_w_kv: jax.Array,
+    gamma_input: jax.Array,
+    gamma_q: jax.Array,
+    gamma_k: jax.Array,
+    num_kv_heads: int = 4,
+    head_dim: int = 128,
+    use_in_kernel_norm: bool = False,
+    use_in_kernel_rope: bool = True,
+    theta: float = 1000000.0,
+    ordering: str = "split",
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+  """Token-Major Q GEMM + Joint W_KV GEMM Pipeline.
+
+  Args:
+    x_mid: Input residual activations [T, H_in] in BF16.
+    w_q_base: Standard token-major Q weight [H_in, H_q * D] in FP8.
+    w_kv_joint: Offline permuted joint KV weight [H_in, 2 * N_kv * D] in FP8.
+    scale_w_q: Static per-channel weight scales for Q [1, H_q * D] in BF16.
+    scale_w_kv: Static per-channel weight scales for KV [1, 2 * N_kv * D] in
+      BF16.
+    gamma_input: Input RMSNorm scale parameters [H_in] in BF16.
+    gamma_q: Q Head RMSNorm scale parameters [D] in BF16.
+    gamma_k: K Head RMSNorm scale parameters [D] in BF16.
+    num_kv_heads: Number of key/value heads.
+    head_dim: Attention head dimension.
+    use_in_kernel_norm: If True, defer Q Head RMSNorm to in-kernel RPAm.
+    use_in_kernel_rope: If True, defer RoPE to in-kernel RPAm computation.
+    theta: RoPE base frequency.
+    ordering: RoPE layout ('split' or 'interleaved').
+
+  Returns:
+    q_final: Token-major Query tensor [T, H_q, D] in BF16.
+    k_final: Key tensor [T, N_kv, D] in FP8.
+    v_final: Value tensor [T, N_kv, D] in FP8.
+    kv_final: Joint Key/Value tensor [T, 2, N_kv, D] in FP8.
+  """
+  x_norm = head_rms_norm(x_mid, gamma_input)
+  x_fp8, scale_x = quantize_to_fp8_dynamic(x_norm)
+
+  # Token-Major Q GEMM
+  q_dequant = (
+      jnp.dot(x_fp8.astype(jnp.float32), w_q_base.astype(jnp.float32))
+      * scale_x.astype(jnp.float32)
+      * scale_w_q.astype(jnp.float32)
+  ).astype(jnp.bfloat16)
+
+  total_tokens, total_q_dim = q_dequant.shape
+  num_q_heads = total_q_dim // head_dim
+  q_3d = q_dequant.reshape(total_tokens, num_q_heads, head_dim)
+
+  if not use_in_kernel_norm:
+    # Separate Q Norm in XLA: fuses with Q GEMM systolic drain
+    q_norm = head_rms_norm(q_3d, gamma_q)
+  else:
+    q_norm = q_3d
+
+  if not use_in_kernel_rope and not use_in_kernel_norm:
+    q_final = apply_reference_rope_5d(q_norm, theta=theta, ordering=ordering)
+  else:
+    q_final = q_norm
+
+  # Joint W_KV GEMM
+  kv_dequant = (
+      jnp.dot(x_fp8.astype(jnp.float32), w_kv_joint.astype(jnp.float32))
+      * scale_x.astype(jnp.float32)
+      * scale_w_kv.astype(jnp.float32)
+  ).astype(jnp.bfloat16)
+  kv_4d = kv_dequant.reshape(total_tokens, 2, num_kv_heads, head_dim)
+
+  k_raw = kv_4d[:, 0, :, :]
+  v_raw = kv_4d[:, 1, :, :]
+
+  # RMSNorm on K only
+  k_norm = head_rms_norm(k_raw, gamma_k)
+  if not use_in_kernel_rope:
+    k_rot = apply_reference_rope_5d(k_norm, theta=theta, ordering=ordering)
+  else:
+    k_rot = k_norm
+  k_final = k_rot.astype(FP8_DTYPE)
+
+  v_final = v_raw.astype(FP8_DTYPE)
+  kv_final = jnp.stack([k_final, v_final], axis=1)
+
+  return q_final, k_final, v_final, kv_final

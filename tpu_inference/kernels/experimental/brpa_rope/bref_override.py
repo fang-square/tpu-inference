@@ -5,8 +5,10 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
-from . import configs
-from . import schedule
+try:
+  from google3.experimental.users.fangfangz.kernels.brpa_rope import configs, schedule
+except (ModuleNotFoundError, ImportError):
+  from . import configs, schedule
 
 
 @jax.tree_util.register_dataclass
@@ -405,11 +407,18 @@ class BatchingORef(pltpu.BufferedRef):
       q_src, q_sz, b = dma_list[i]
       if self.cfgs.serve.use_strided_dma:
         for h_kv in range(self.cfgs.model.num_kv_heads):
-          pltpu.make_async_copy(
-              vmem_src.at[b, h_kv, pl.ds(0, q_sz)],
-              o_hbm.at[pl.ds(q_src, q_sz), h_kv],
-              sem,
-          ).start()
+          if self.cfgs.serve.is_kv_group_major:
+            pltpu.make_async_copy(
+                vmem_src.at[b, h_kv, pl.ds(0, q_sz)],
+                o_hbm.at[h_kv, pl.ds(q_src, q_sz)],
+                sem,
+            ).start()
+          else:
+            pltpu.make_async_copy(
+                vmem_src.at[b, h_kv, pl.ds(0, q_sz)],
+                o_hbm.at[pl.ds(q_src, q_sz), h_kv],
+                sem,
+            ).start()
       else:
         pltpu.make_async_copy(
             vmem_src.at[b, :, pl.ds(0, q_sz)],
@@ -498,11 +507,18 @@ class BatchingQRef(pltpu.BufferedRef):
       q_src, q_sz, b = dma_list[i]
       if self.cfgs.serve.use_strided_dma:
         for h_kv in range(self.cfgs.model.num_kv_heads):
-          pltpu.make_async_copy(
-              q_hbm.at[pl.ds(q_src, q_sz), h_kv],
-              vmem_dst.at[b, h_kv, pl.ds(0, q_sz)],
-              sem,
-          ).start()
+          if self.cfgs.serve.is_kv_group_major:
+            pltpu.make_async_copy(
+                q_hbm.at[h_kv, pl.ds(q_src, q_sz)],
+                vmem_dst.at[b, h_kv, pl.ds(0, q_sz)],
+                sem,
+            ).start()
+          else:
+            pltpu.make_async_copy(
+                q_hbm.at[pl.ds(q_src, q_sz), h_kv],
+                vmem_dst.at[b, h_kv, pl.ds(0, q_sz)],
+                sem,
+            ).start()
       else:
         pltpu.make_async_copy(
             q_hbm.at[:, pl.ds(q_src, q_sz)],
