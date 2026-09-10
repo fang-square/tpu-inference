@@ -8,10 +8,8 @@ from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 import numpy as np
 
-try:
-  from google3.experimental.users.fangfangz.kernels.brpa_rope import configs, utils
-except (ModuleNotFoundError, ImportError):
-  from . import configs, utils
+from . import configs
+from . import utils
 
 
 class FieldOffset:
@@ -22,6 +20,7 @@ class FieldOffset:
   but it natively supports retrieving/updating single dynamically-indexed
   elements (e.g. `data.at[pos+1]`).
   """
+
   def __init__(self, offset: int):
     self.offset = offset
 
@@ -56,6 +55,7 @@ class SeqAlongLaneDmaNew:
 
   def set_flags(self, fetch_val, wb_val):
     self.flags[...] = fetch_val | (wb_val << 1)
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)

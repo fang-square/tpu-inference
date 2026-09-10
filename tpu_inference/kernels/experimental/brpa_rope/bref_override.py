@@ -5,10 +5,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
-try:
-  from google3.experimental.users.fangfangz.kernels.brpa_rope import configs, schedule
-except (ModuleNotFoundError, ImportError):
-  from . import configs, schedule
+from . import configs
+from . import schedule
 
 
 @jax.tree_util.register_dataclass
@@ -405,7 +403,14 @@ class BatchingORef(pltpu.BufferedRef):
 
     for i in range(len(dma_list)):
       q_src, q_sz, b = dma_list[i]
-      if self.cfgs.serve.use_strided_dma:
+      if self.cfgs.serve.out_token_major:
+        for h_kv in range(self.cfgs.model.num_kv_heads):
+          pltpu.make_async_copy(
+              vmem_src.at[b, h_kv, pl.ds(0, q_sz)],
+              o_hbm.at[pl.ds(q_src, q_sz), h_kv],
+              sem,
+          ).start()
+      elif self.cfgs.serve.use_strided_dma:
         for h_kv in range(self.cfgs.model.num_kv_heads):
           if self.cfgs.serve.is_kv_group_major:
             pltpu.make_async_copy(

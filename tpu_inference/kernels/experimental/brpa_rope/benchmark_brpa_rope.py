@@ -23,12 +23,12 @@ import jax
 import jax.numpy as jnp
 
 try:
-  from google3.experimental.users.fangfangz.kernels.brpa_rope import configs, pallas_rmsnorm, qkv_pipeline, wrapper
+  from tpu_inference.kernels.experimental.brpa_rope import configs, pallas_rmsnorm, qkv_pipeline, wrapper
 except (ModuleNotFoundError, ImportError):
   try:
+    from google3.experimental.users.fangfangz.kernels.brpa_rope import configs, pallas_rmsnorm, qkv_pipeline, wrapper
+  except ModuleNotFoundError:
     from experimental.users.fangfangz.kernels.brpa_rope import configs, pallas_rmsnorm, qkv_pipeline, wrapper
-  except (ModuleNotFoundError, ImportError):
-    from tpu_inference.kernels.experimental.brpa_rope import configs, pallas_rmsnorm, qkv_pipeline, wrapper
 
 try:
   from google3.perftools.accelerators.xprof.api.python import xprof_analysis_client
@@ -74,6 +74,18 @@ flags.DEFINE_enum(
     "Benchmark mode to run.",
 )
 flags.DEFINE_bool("record_xprof", True, "Capture programmatic XProf trace.")
+flags.DEFINE_bool(
+    "out_token_major",
+    False,
+    "Whether to write attention output directly in token-major layout [T,"
+    " H_q, D].",
+)
+flags.DEFINE_bool(
+    "include_pre_gemm_staging",
+    True,
+    "Whether to include pre-GEMM layout staging copies in non-head-sharded KV"
+    " pipelines to match hardware trace.",
+)
 
 
 def apply_reference_rope(
@@ -171,6 +183,8 @@ def run_benchmark():
       f" bq_c_sz={FLAGS.bq_c_sz}"
   )
   print(f"  RoPE: theta={theta}, ordering={ordering}")
+  print(f"  Pre-GEMM Staging: {FLAGS.include_pre_gemm_staging}")
+  print(f"  Attention Output Token Major: {FLAGS.out_token_major}")
   print("=" * 85)
 
   decode_blocks = configs.BlockSizes(
@@ -255,8 +269,22 @@ def run_benchmark():
   w_kv_fp8, scale_w_kv = qkv_pipeline.quantize_joint_kv_weight_to_fp8(
       w_kv_joint
   )
+  w_kv_head_sharded = qkv_pipeline.permute_joint_kv_weights_head_sharded(
+      w_k_base, w_v_base, num_kv_heads, head_dim
+  )
+  w_kv_hs_fp8, scale_w_kv_hs = (
+      qkv_pipeline.quantize_head_sharded_joint_kv_weight_to_fp8(
+          w_kv_head_sharded
+      )
+  )
   w_q_base_fp8, scale_w_q_base = qkv_pipeline.quantize_weight_to_fp8_static(
       w_q_base
+  )
+  w_k_base_fp8, scale_w_k_base = qkv_pipeline.quantize_weight_to_fp8_static(
+      w_k_base
+  )
+  w_v_base_fp8, scale_w_v_base = qkv_pipeline.quantize_weight_to_fp8_static(
+      w_v_base
   )
 
   max_model_len = 4096
@@ -457,6 +485,7 @@ def run_benchmark():
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
             use_in_kernel_rope=True,
+            include_pre_gemm_staging=FLAGS.include_pre_gemm_staging,
         )
     )
     out, new_cache = wrapper.ragged_paged_attention_rope(
@@ -478,7 +507,12 @@ def run_benchmark():
         vmem_limit_bytes=vmem_limit_bytes,
         is_kv_group_major=True,
         use_strided_dma=False,
+        out_token_major=FLAGS.out_token_major,
     )
+    if not FLAGS.out_token_major:
+      out = out.transpose(1, 0, 2, 3).reshape(
+          total_tokens, num_q_heads, head_dim
+      )
     return out, new_cache
 
   # 7. Test 1: KV head Major Q + joint KV + In Kernel Norm and RoPE
@@ -497,6 +531,7 @@ def run_benchmark():
             head_dim=head_dim,
             use_in_kernel_norm=True,
             use_in_kernel_rope=True,
+            include_pre_gemm_staging=FLAGS.include_pre_gemm_staging,
         )
     )
     out, new_cache = wrapper.ragged_paged_attention_rope(
@@ -518,9 +553,14 @@ def run_benchmark():
         vmem_limit_bytes=vmem_limit_bytes,
         is_kv_group_major=True,
         use_strided_dma=False,
+        out_token_major=FLAGS.out_token_major,
         apply_rmsnorm=True,
         gamma_q=None,
     )
+    if not FLAGS.out_token_major:
+      out = out.transpose(1, 0, 2, 3).reshape(
+          total_tokens, num_q_heads, head_dim
+      )
     return out, new_cache
 
   # 8. Test 2: Token Major Q + separate Q Norm + joint KV + Strided DMA + In Kernel RoPE
@@ -539,6 +579,7 @@ def run_benchmark():
             head_dim=head_dim,
             use_in_kernel_norm=False,
             use_in_kernel_rope=True,
+            include_pre_gemm_staging=FLAGS.include_pre_gemm_staging,
         )
     )
     out, new_cache = wrapper.ragged_paged_attention_rope(
@@ -580,6 +621,7 @@ def run_benchmark():
             head_dim=head_dim,
             use_in_kernel_norm=True,
             use_in_kernel_rope=True,
+            include_pre_gemm_staging=FLAGS.include_pre_gemm_staging,
         )
     )
     out, new_cache = wrapper.ragged_paged_attention_rope(
@@ -601,9 +643,14 @@ def run_benchmark():
         vmem_limit_bytes=vmem_limit_bytes,
         is_kv_group_major=True,
         use_strided_dma=True,
+        out_token_major=FLAGS.out_token_major,
         apply_rmsnorm=True,
         gamma_q=None,
     )
+    if not FLAGS.out_token_major:
+      out = out.transpose(1, 0, 2, 3).reshape(
+          total_tokens, num_q_heads, head_dim
+      )
     return out, new_cache
 
   # 10. Test 3b: Token Major Q + joint KV + strided DMA + In kernel Norm and RoPE
@@ -622,6 +669,7 @@ def run_benchmark():
             head_dim=head_dim,
             use_in_kernel_norm=True,
             use_in_kernel_rope=True,
+            include_pre_gemm_staging=FLAGS.include_pre_gemm_staging,
         )
     )
     out, new_cache = wrapper.ragged_paged_attention_rope(
@@ -665,6 +713,7 @@ def run_benchmark():
             use_in_kernel_norm=False,
             use_pallas_2d_norm=True,
             use_in_kernel_rope=True,
+            include_pre_gemm_staging=FLAGS.include_pre_gemm_staging,
         )
     )
     out, new_cache = wrapper.ragged_paged_attention_rope(
@@ -686,13 +735,274 @@ def run_benchmark():
         vmem_limit_bytes=vmem_limit_bytes,
         is_kv_group_major=True,
         use_strided_dma=False,
+        out_token_major=FLAGS.out_token_major,
         apply_rmsnorm=False,
         gamma_q=None,
     )
+    if not FLAGS.out_token_major:
+      out = out.transpose(1, 0, 2, 3).reshape(
+          total_tokens, num_q_heads, head_dim
+      )
+    return out, new_cache
+
+  # 12. Test 5 (Solution C): KV-head Major Q + joint KV + Fused Pallas RMSNorm & RoPE + Zero-Copy bRPA (RoPE Bypassed in RPAm)
+  def test5_pipeline_step(x_in, cache_in):
+    q_out, k_out, v_out, _ = (
+        qkv_pipeline.qkv_projection_pipeline_head_major_q_joint_kv(
+            x_mid=x_in,
+            w_q_kv_major=w_q_fp8,
+            w_kv_joint=w_kv_fp8,
+            scale_w_q=scale_w_q,
+            scale_w_kv=scale_w_kv,
+            gamma_input=gamma_in,
+            gamma_q=gamma_q,
+            gamma_k=gamma_k,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            use_in_kernel_norm=False,
+            use_pallas_2d_norm=False,
+            use_pallas_fused_norm_rope=True,
+            use_in_kernel_rope=False,
+            include_pre_gemm_staging=FLAGS.include_pre_gemm_staging,
+        )
+    )
+    out, new_cache = wrapper.ragged_paged_attention_rope(
+        queries=q_out,
+        keys=k_out,
+        values=v_out,
+        kv_cache=cache_in,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        rope_theta=theta,
+        rope_dim=head_dim,
+        rope_input_ordering=ordering,
+        sm_scale=sm_scale,
+        kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+        decode_block_sizes=decode_blocks,
+        prefill_block_sizes=prefill_blocks,
+        vmem_limit_bytes=vmem_limit_bytes,
+        is_kv_group_major=True,
+        use_strided_dma=False,
+        out_token_major=FLAGS.out_token_major,
+        apply_rmsnorm=False,
+        gamma_q=None,
+        apply_rope=False,
+    )
+    if not FLAGS.out_token_major:
+      out = out.transpose(1, 0, 2, 3).reshape(
+          total_tokens, num_q_heads, head_dim
+      )
+    return out, new_cache
+
+  # 13. Test 6: Head-Sharded Joint W_KV + Dedicated 2D Pallas RMSNorm + Zero-Copy bRPA
+  def test6_pipeline_step(x_in, cache_in):
+    q_out, k_out, v_out, _ = (
+        qkv_pipeline.qkv_projection_pipeline_head_sharded_joint_kv(
+            x_mid=x_in,
+            w_q_kv_major=w_q_fp8,
+            w_kv_head_sharded=w_kv_hs_fp8,
+            scale_w_q=scale_w_q,
+            scale_w_kv=scale_w_kv_hs,
+            gamma_input=gamma_in,
+            gamma_q=gamma_q,
+            gamma_k=gamma_k,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            use_in_kernel_norm=False,
+            use_pallas_2d_norm=True,
+            use_in_kernel_rope=True,
+        )
+    )
+    out, new_cache = wrapper.ragged_paged_attention_rope(
+        queries=q_out,
+        keys=k_out,
+        values=v_out,
+        kv_cache=cache_in,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        rope_theta=theta,
+        rope_dim=head_dim,
+        rope_input_ordering=ordering,
+        sm_scale=sm_scale,
+        kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+        decode_block_sizes=decode_blocks,
+        prefill_block_sizes=prefill_blocks,
+        vmem_limit_bytes=vmem_limit_bytes,
+        is_kv_group_major=True,
+        use_strided_dma=False,
+        out_token_major=FLAGS.out_token_major,
+        apply_rmsnorm=False,
+        gamma_q=None,
+    )
+    if not FLAGS.out_token_major:
+      out = out.transpose(1, 0, 2, 3).reshape(
+          total_tokens, num_q_heads, head_dim
+      )
+    return out, new_cache
+
+  # 14. Test 7: Head-Sharded Joint W_KV + Fused Pallas RMSNorm & RoPE + Zero-Copy bRPA
+  def test7_pipeline_step(x_in, cache_in):
+    q_out, k_out, v_out, _ = (
+        qkv_pipeline.qkv_projection_pipeline_head_sharded_joint_kv(
+            x_mid=x_in,
+            w_q_kv_major=w_q_fp8,
+            w_kv_head_sharded=w_kv_hs_fp8,
+            scale_w_q=scale_w_q,
+            scale_w_kv=scale_w_kv_hs,
+            gamma_input=gamma_in,
+            gamma_q=gamma_q,
+            gamma_k=gamma_k,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            use_in_kernel_norm=False,
+            use_pallas_2d_norm=False,
+            use_pallas_fused_norm_rope=True,
+            use_in_kernel_rope=False,
+        )
+    )
+    out, new_cache = wrapper.ragged_paged_attention_rope(
+        queries=q_out,
+        keys=k_out,
+        values=v_out,
+        kv_cache=cache_in,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        rope_theta=theta,
+        rope_dim=head_dim,
+        rope_input_ordering=ordering,
+        sm_scale=sm_scale,
+        kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+        decode_block_sizes=decode_blocks,
+        prefill_block_sizes=prefill_blocks,
+        vmem_limit_bytes=vmem_limit_bytes,
+        is_kv_group_major=True,
+        use_strided_dma=False,
+        out_token_major=FLAGS.out_token_major,
+        apply_rmsnorm=False,
+        gamma_q=None,
+        apply_rope=False,
+    )
+    if not FLAGS.out_token_major:
+      out = out.transpose(1, 0, 2, 3).reshape(
+          total_tokens, num_q_heads, head_dim
+      )
+    return out, new_cache
+
+  # 15. Test 8: Head-Major Q + Separate W_K, W_V + Dedicated 2D Pallas RMSNorm + Zero-Copy bRPA
+  def test8_pipeline_step(x_in, cache_in):
+    q_out, k_out, v_out, _ = (
+        qkv_pipeline.qkv_projection_pipeline_head_major_q_separate_kv(
+            x_mid=x_in,
+            w_q_kv_major=w_q_fp8,
+            w_k_base=w_k_base_fp8,
+            w_v_base=w_v_base_fp8,
+            scale_w_q=scale_w_q,
+            scale_w_k=scale_w_k_base,
+            scale_w_v=scale_w_v_base,
+            gamma_input=gamma_in,
+            gamma_q=gamma_q,
+            gamma_k=gamma_k,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            use_in_kernel_norm=False,
+            use_pallas_2d_norm=True,
+            use_in_kernel_rope=True,
+        )
+    )
+    out, new_cache = wrapper.ragged_paged_attention_rope(
+        queries=q_out,
+        keys=k_out,
+        values=v_out,
+        kv_cache=cache_in,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        rope_theta=theta,
+        rope_dim=head_dim,
+        rope_input_ordering=ordering,
+        sm_scale=sm_scale,
+        kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+        decode_block_sizes=decode_blocks,
+        prefill_block_sizes=prefill_blocks,
+        vmem_limit_bytes=vmem_limit_bytes,
+        is_kv_group_major=True,
+        use_strided_dma=False,
+        out_token_major=FLAGS.out_token_major,
+        apply_rmsnorm=False,
+        gamma_q=None,
+    )
+    if not FLAGS.out_token_major:
+      out = out.transpose(1, 0, 2, 3).reshape(
+          total_tokens, num_q_heads, head_dim
+      )
+    return out, new_cache
+
+  # 16. Test 9: Head-Major Q + Separate W_K, W_V + Fused Pallas RMSNorm & RoPE + Zero-Copy bRPA
+  def test9_pipeline_step(x_in, cache_in):
+    q_out, k_out, v_out, _ = (
+        qkv_pipeline.qkv_projection_pipeline_head_major_q_separate_kv(
+            x_mid=x_in,
+            w_q_kv_major=w_q_fp8,
+            w_k_base=w_k_base_fp8,
+            w_v_base=w_v_base_fp8,
+            scale_w_q=scale_w_q,
+            scale_w_k=scale_w_k_base,
+            scale_w_v=scale_w_v_base,
+            gamma_input=gamma_in,
+            gamma_q=gamma_q,
+            gamma_k=gamma_k,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            use_in_kernel_norm=False,
+            use_pallas_2d_norm=False,
+            use_pallas_fused_norm_rope=True,
+            use_in_kernel_rope=False,
+        )
+    )
+    out, new_cache = wrapper.ragged_paged_attention_rope(
+        queries=q_out,
+        keys=k_out,
+        values=v_out,
+        kv_cache=cache_in,
+        kv_lens=kv_lens,
+        page_indices=page_indices,
+        cu_q_lens=cu_q_lens,
+        distribution=distribution,
+        rope_theta=theta,
+        rope_dim=head_dim,
+        rope_input_ordering=ordering,
+        sm_scale=sm_scale,
+        kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
+        decode_block_sizes=decode_blocks,
+        prefill_block_sizes=prefill_blocks,
+        vmem_limit_bytes=vmem_limit_bytes,
+        is_kv_group_major=True,
+        use_strided_dma=False,
+        out_token_major=FLAGS.out_token_major,
+        apply_rmsnorm=False,
+        gamma_q=None,
+        apply_rope=False,
+    )
+    if not FLAGS.out_token_major:
+      out = out.transpose(1, 0, 2, 3).reshape(
+          total_tokens, num_q_heads, head_dim
+      )
     return out, new_cache
 
   def isolated_pallas_norm_step(q_in):
     return pallas_rmsnorm.pallas_2d_rmsnorm(q_in, gamma_q)
+
+  def isolated_pallas_fused_norm_rope_step(q_in):
+    return pallas_rmsnorm.pallas_2d_rmsnorm_rope(
+        q_in, gamma_q, theta=theta, ordering=ordering
+    )
 
   if FLAGS.benchmark_mode != "three_tests":
     jitted_no_rope = jax.jit(no_rope_step, donate_argnums=(3,))
@@ -709,7 +1019,13 @@ def run_benchmark():
   jitted_test3 = jax.jit(test3_pipeline_step, donate_argnums=(1,))
   jitted_test3b = jax.jit(test3b_pipeline_step, donate_argnums=(1,))
   jitted_test4 = jax.jit(test4_pipeline_step, donate_argnums=(1,))
+  jitted_test5 = jax.jit(test5_pipeline_step, donate_argnums=(1,))
+  jitted_test6 = jax.jit(test6_pipeline_step, donate_argnums=(1,))
+  jitted_test7 = jax.jit(test7_pipeline_step, donate_argnums=(1,))
+  jitted_test8 = jax.jit(test8_pipeline_step, donate_argnums=(1,))
+  jitted_test9 = jax.jit(test9_pipeline_step, donate_argnums=(1,))
   jitted_pallas_norm = jax.jit(isolated_pallas_norm_step)
+  jitted_pallas_fused_norm_rope = jax.jit(isolated_pallas_fused_norm_rope_step)
 
   # Run warmup
   print("\nRunning warmup iterations...", flush=True)
@@ -741,6 +1057,16 @@ def run_benchmark():
   out_t3b.block_until_ready()
   out_t4, kv_cache = jitted_test4(x_mid, kv_cache)
   out_t4.block_until_ready()
+  out_t5, kv_cache = jitted_test5(x_mid, kv_cache)
+  out_t5.block_until_ready()
+  out_t6, kv_cache = jitted_test6(x_mid, kv_cache)
+  out_t6.block_until_ready()
+  out_t7, kv_cache = jitted_test7(x_mid, kv_cache)
+  out_t7.block_until_ready()
+  out_t8, kv_cache = jitted_test8(x_mid, kv_cache)
+  out_t8.block_until_ready()
+  out_t9, kv_cache = jitted_test9(x_mid, kv_cache)
+  out_t9.block_until_ready()
 
   for _ in range(FLAGS.num_warmup):
     if FLAGS.benchmark_mode != "three_tests":
@@ -766,6 +1092,16 @@ def run_benchmark():
     out_t3b.block_until_ready()
     out_t4, kv_cache = jitted_test4(x_mid, kv_cache)
     out_t4.block_until_ready()
+    out_t5, kv_cache = jitted_test5(x_mid, kv_cache)
+    out_t5.block_until_ready()
+    out_t6, kv_cache = jitted_test6(x_mid, kv_cache)
+    out_t6.block_until_ready()
+    out_t7, kv_cache = jitted_test7(x_mid, kv_cache)
+    out_t7.block_until_ready()
+    out_t8, kv_cache = jitted_test8(x_mid, kv_cache)
+    out_t8.block_until_ready()
+    out_t9, kv_cache = jitted_test9(x_mid, kv_cache)
+    out_t9.block_until_ready()
 
   # Numerical parity
   print("\nNumerical Parity Verification on Hardware:")
@@ -785,10 +1121,7 @@ def run_benchmark():
     print(f"    Max Absolute Difference:  {float(jnp.max(diff_sd)):.6e}")
     print(f"    Mean Absolute Difference: {float(jnp.mean(diff_sd)):.6e}")
 
-    out_kv_reconstructed = out_kv.transpose(1, 0, 2, 3).reshape(
-        total_tokens, num_q_heads, head_dim
-    )
-    diff_kv = jnp.abs(out_kv_reconstructed - out_b)
+    diff_kv = jnp.abs(out_kv - out_b)
     print("  KV-Group Major Zero-Copy vs Baseline:")
     print(f"    Max Absolute Difference:  {float(jnp.max(diff_kv)):.6e}")
     print(f"    Mean Absolute Difference: {float(jnp.mean(diff_kv)):.6e}")
@@ -804,13 +1137,10 @@ def run_benchmark():
   print(f"    Max Absolute Difference:  {float(jnp.max(diff_t2_t3b)):.6e}")
   print(f"    Mean Absolute Difference: {float(jnp.mean(diff_t2_t3b)):.6e}")
 
-  out_t1_rec = out_t1.transpose(1, 0, 2, 3).reshape(
-      total_tokens, num_q_heads, head_dim
-  )
-  diff_t1_t2 = jnp.abs(out_t1_rec - out_t2)
+  diff_t1_t2 = jnp.abs(out_t1 - out_t2)
   cos_sim_1_2 = float(
-      jnp.sum(out_t1_rec * out_t2)
-      / (jnp.linalg.norm(out_t1_rec) * jnp.linalg.norm(out_t2) + 1e-9)
+      jnp.sum(out_t1 * out_t2)
+      / (jnp.linalg.norm(out_t1) * jnp.linalg.norm(out_t2) + 1e-9)
   )
   print(
       "  Test 1 vs Test 2 (KV-head Major In-Kernel Norm vs Token Major Fused"
@@ -831,6 +1161,68 @@ def run_benchmark():
   print(f"    Cosine Similarity:        {cos_sim_1_4:.6f}")
   print(f"    Max Absolute Difference:  {float(jnp.max(diff_t1_t4)):.6e}")
   print(f"    Mean Absolute Difference: {float(jnp.mean(diff_t1_t4)):.6e}")
+
+  diff_t4_t5 = jnp.abs(out_t4 - out_t5)
+  cos_sim_4_5 = float(
+      jnp.sum(out_t4 * out_t5)
+      / (jnp.linalg.norm(out_t4) * jnp.linalg.norm(out_t5) + 1e-9)
+  )
+  print(
+      "  Test 4 vs Test 5 (Dedicated 2D Norm + RPAm RoPE vs Fused 2D Norm &"
+      " RoPE):"
+  )
+  print(f"    Cosine Similarity:        {cos_sim_4_5:.6f}")
+  print(f"    Max Absolute Difference:  {float(jnp.max(diff_t4_t5)):.6e}")
+  print(f"    Mean Absolute Difference: {float(jnp.mean(diff_t4_t5)):.6e}")
+
+  diff_t4_t6 = jnp.abs(out_t4 - out_t6)
+  cos_sim_4_6 = float(
+      jnp.sum(out_t4 * out_t6)
+      / (jnp.linalg.norm(out_t4) * jnp.linalg.norm(out_t6) + 1e-9)
+  )
+  print(
+      "  Test 4 vs Test 6 (Baseline Joint KV vs Head-Sharded Joint KV + 2D"
+      " Pallas Norm):"
+  )
+  print(f"    Cosine Similarity:        {cos_sim_4_6:.6f}")
+  print(f"    Max Absolute Difference:  {float(jnp.max(diff_t4_t6)):.6e}")
+  print(f"    Mean Absolute Difference: {float(jnp.mean(diff_t4_t6)):.6e}")
+
+  diff_t5_t7 = jnp.abs(out_t5 - out_t7)
+  cos_sim_5_7 = float(
+      jnp.sum(out_t5 * out_t7)
+      / (jnp.linalg.norm(out_t5) * jnp.linalg.norm(out_t7) + 1e-9)
+  )
+  print(
+      "  Test 5 vs Test 7 (Baseline Joint KV vs Head-Sharded Joint KV + Fused"
+      " Pallas Norm & RoPE):"
+  )
+  print(f"    Cosine Similarity:        {cos_sim_5_7:.6f}")
+  print(f"    Max Absolute Difference:  {float(jnp.max(diff_t5_t7)):.6e}")
+  print(f"    Mean Absolute Difference: {float(jnp.mean(diff_t5_t7)):.6e}")
+
+  diff_t4_t8 = jnp.abs(out_t4 - out_t8)
+  cos_sim_4_8 = float(
+      jnp.sum(out_t4 * out_t8)
+      / (jnp.linalg.norm(out_t4) * jnp.linalg.norm(out_t8) + 1e-9)
+  )
+  print("  Test 4 vs Test 8 (Joint KV vs Separate W_K, W_V + 2D Pallas Norm):")
+  print(f"    Cosine Similarity:        {cos_sim_4_8:.6f}")
+  print(f"    Max Absolute Difference:  {float(jnp.max(diff_t4_t8)):.6e}")
+  print(f"    Mean Absolute Difference: {float(jnp.mean(diff_t4_t8)):.6e}")
+
+  diff_t5_t9 = jnp.abs(out_t5 - out_t9)
+  cos_sim_5_9 = float(
+      jnp.sum(out_t5 * out_t9)
+      / (jnp.linalg.norm(out_t5) * jnp.linalg.norm(out_t9) + 1e-9)
+  )
+  print(
+      "  Test 5 vs Test 9 (Joint KV vs Separate W_K, W_V + Fused Pallas Norm &"
+      " RoPE):"
+  )
+  print(f"    Cosine Similarity:        {cos_sim_5_9:.6f}")
+  print(f"    Max Absolute Difference:  {float(jnp.max(diff_t5_t9)):.6e}")
+  print(f"    Mean Absolute Difference: {float(jnp.mean(diff_t5_t9)):.6e}")
 
   def time_func(fn, inputs, cache_idx, label):
     session = None
@@ -1132,6 +1524,131 @@ def run_benchmark():
   if t4_sid:
     print(f"    XProf Trace:             http://xprof/?session_id={t4_sid}")
 
+  # Test 5 (Solution C)
+  t5_lats, t5_sid, kv_cache = time_func(
+      jitted_test5,
+      (x_mid, kv_cache),
+      1,
+      "test5_kv_major_fused_pallas_norm_rope",
+  )
+  t5_durs = get_kernel_durations(t5_sid) if t5_sid else {}
+  t5_device_us = np.mean(t5_durs["RPAm"]) if t5_durs.get("RPAm") else 0.0
+  t5_mean = np.mean(t5_lats)
+  print(
+      "\n5. Test 5: KV-head Major Q + joint KV + Fused Pallas RMSNorm & RoPE +"
+      " Zero-Copy bRPA (RoPE Bypassed in RPAm):"
+  )
+  print(f"    Host Mean Latency:       {t5_mean:.2f} µs")
+  print(f"    Extrapolated 64L:        {t5_mean * 64 / 1000.0:.2f} ms")
+  print(
+      f"    Savings vs Ref:          {dec_mean - t5_mean:+.2f} µs"
+      f" ({dec_mean / max(t5_mean, 1e-6):.2f}x)"
+  )
+  if t5_device_us > 0:
+    print(f"    Device (RPAm) Mean:      {t5_device_us:.2f} µs")
+  if t5_sid:
+    print(f"    XProf Trace:             http://xprof/?session_id={t5_sid}")
+
+  # Test 6: Head-Sharded Joint W_KV + Dedicated 2D Pallas RMSNorm + Zero-Copy bRPA
+  t6_lats, t6_sid, kv_cache = time_func(
+      jitted_test6,
+      (x_mid, kv_cache),
+      1,
+      "test6_head_sharded_kv_2d_pallas_norm_token_major_out",
+  )
+  t6_durs = get_kernel_durations(t6_sid) if t6_sid else {}
+  t6_device_us = np.mean(t6_durs["RPAm"]) if t6_durs.get("RPAm") else 0.0
+  t6_mean = np.mean(t6_lats)
+  print(
+      "\n6. Test 6: Head-Sharded Joint W_KV + Dedicated 2D Pallas RMSNorm +"
+      " Zero-Copy bRPA (Token-Major Out):"
+  )
+  print(f"    Host Mean Latency:       {t6_mean:.2f} µs")
+  print(f"    Extrapolated 64L:        {t6_mean * 64 / 1000.0:.2f} ms")
+  print(
+      f"    Savings vs Ref:          {dec_mean - t6_mean:+.2f} µs"
+      f" ({dec_mean / max(t6_mean, 1e-6):.2f}x)"
+  )
+  if t6_device_us > 0:
+    print(f"    Device (RPAm) Mean:      {t6_device_us:.2f} µs")
+  if t6_sid:
+    print(f"    XProf Trace:             http://xprof/?session_id={t6_sid}")
+
+  # Test 7: Head-Sharded Joint W_KV + Fused Pallas RMSNorm & RoPE + Zero-Copy bRPA
+  t7_lats, t7_sid, kv_cache = time_func(
+      jitted_test7,
+      (x_mid, kv_cache),
+      1,
+      "test7_head_sharded_kv_fused_pallas_norm_rope_token_major_out",
+  )
+  t7_durs = get_kernel_durations(t7_sid) if t7_sid else {}
+  t7_device_us = np.mean(t7_durs["RPAm"]) if t7_durs.get("RPAm") else 0.0
+  t7_mean = np.mean(t7_lats)
+  print(
+      "\n7. Test 7: Head-Sharded Joint W_KV + Fused Pallas RMSNorm & RoPE +"
+      " Zero-Copy bRPA (Token-Major Out):"
+  )
+  print(f"    Host Mean Latency:       {t7_mean:.2f} µs")
+  print(f"    Extrapolated 64L:        {t7_mean * 64 / 1000.0:.2f} ms")
+  print(
+      f"    Savings vs Ref:          {dec_mean - t7_mean:+.2f} µs"
+      f" ({dec_mean / max(t7_mean, 1e-6):.2f}x)"
+  )
+  if t7_device_us > 0:
+    print(f"    Device (RPAm) Mean:      {t7_device_us:.2f} µs")
+  if t7_sid:
+    print(f"    XProf Trace:             http://xprof/?session_id={t7_sid}")
+
+  # Test 8: Head-Major Q + Separate W_K, W_V + Dedicated 2D Pallas RMSNorm + Zero-Copy bRPA
+  t8_lats, t8_sid, kv_cache = time_func(
+      jitted_test8,
+      (x_mid, kv_cache),
+      1,
+      "test8_separate_kv_2d_pallas_norm_token_major_out",
+  )
+  t8_durs = get_kernel_durations(t8_sid) if t8_sid else {}
+  t8_device_us = np.mean(t8_durs["RPAm"]) if t8_durs.get("RPAm") else 0.0
+  t8_mean = np.mean(t8_lats)
+  print(
+      "\n8. Test 8: Head-Major Q + Separate W_K, W_V + Dedicated 2D Pallas"
+      " RMSNorm + Zero-Copy bRPA (Token-Major Out):"
+  )
+  print(f"    Host Mean Latency:       {t8_mean:.2f} µs")
+  print(f"    Extrapolated 64L:        {t8_mean * 64 / 1000.0:.2f} ms")
+  print(
+      f"    Savings vs Ref:          {dec_mean - t8_mean:+.2f} µs"
+      f" ({dec_mean / max(t8_mean, 1e-6):.2f}x)"
+  )
+  if t8_device_us > 0:
+    print(f"    Device (RPAm) Mean:      {t8_device_us:.2f} µs")
+  if t8_sid:
+    print(f"    XProf Trace:             http://xprof/?session_id={t8_sid}")
+
+  # Test 9: Head-Major Q + Separate W_K, W_V + Fused Pallas RMSNorm & RoPE + Zero-Copy bRPA
+  t9_lats, t9_sid, kv_cache = time_func(
+      jitted_test9,
+      (x_mid, kv_cache),
+      1,
+      "test9_separate_kv_fused_pallas_norm_rope_token_major_out",
+  )
+  t9_durs = get_kernel_durations(t9_sid) if t9_sid else {}
+  t9_device_us = np.mean(t9_durs["RPAm"]) if t9_durs.get("RPAm") else 0.0
+  t9_mean = np.mean(t9_lats)
+  print(
+      "\n9. Test 9: Head-Major Q + Separate W_K, W_V + Fused Pallas RMSNorm &"
+      " RoPE + Zero-Copy bRPA (Token-Major Out):"
+  )
+  print(f"    Host Mean Latency:       {t9_mean:.2f} µs")
+  print(f"    Extrapolated 64L:        {t9_mean * 64 / 1000.0:.2f} ms")
+  print(
+      f"    Savings vs Ref:          {dec_mean - t9_mean:+.2f} µs"
+      f" ({dec_mean / max(t9_mean, 1e-6):.2f}x)"
+  )
+  if t9_device_us > 0:
+    print(f"    Device (RPAm) Mean:      {t9_device_us:.2f} µs")
+  if t9_sid:
+    print(f"    XProf Trace:             http://xprof/?session_id={t9_sid}")
+
   # Isolated Standalone 2D Pallas RMSNorm kernel timing
   norm_lats = []
   out_norm = jitted_pallas_norm(q_kv_major)
@@ -1145,6 +1662,21 @@ def run_benchmark():
   norm_mean = np.mean(norm_lats)
   print(
       f"\n>>> Isolated Standalone 2D Pallas RMSNorm Kernel: {norm_mean:.2f} µs"
+  )
+
+  # Isolated Fused 2D Pallas RMSNorm + RoPE kernel timing
+  fnr_lats = []
+  out_fnr = jitted_pallas_fused_norm_rope(q_kv_major)
+  out_fnr.block_until_ready()
+  for _ in range(FLAGS.num_iters):
+    t0 = time.perf_counter()
+    out_fnr = jitted_pallas_fused_norm_rope(q_kv_major)
+    out_fnr.block_until_ready()
+    t1 = time.perf_counter()
+    fnr_lats.append((t1 - t0) * 1e6)
+  fnr_mean = np.mean(fnr_lats)
+  print(
+      f"\n>>> Isolated Fused 2D Pallas RMSNorm + RoPE Kernel: {fnr_mean:.2f} µs"
   )
 
   print("\n" + "=" * 90)
@@ -1180,6 +1712,31 @@ def run_benchmark():
       f"{'4. KV-Major Q + 2D Pallas Norm (Solution B)':<48} | {t4_mean:>7.2f}"
       f" µs | {t4_mean*64/1000:>7.2f} ms |"
       f" {dec_mean/max(t4_mean,1e-6):>9.2f}x"
+  )
+  print(
+      f"{'5. KV-Major Q + Fused Pallas Norm & RoPE':<48} | {t5_mean:>7.2f}"
+      f" µs | {t5_mean*64/1000:>7.2f} ms |"
+      f" {dec_mean/max(t5_mean,1e-6):>9.2f}x"
+  )
+  print(
+      f"{'6. Head-Sharded KV + 2D Pallas Norm (Token Out)':<48} |"
+      f" {t6_mean:>7.2f} µs | {t6_mean*64/1000:>7.2f} ms |"
+      f" {dec_mean/max(t6_mean,1e-6):>9.2f}x"
+  )
+  print(
+      f"{'7. Head-Sharded KV + Fused Norm/RoPE (Token Out)':<48} |"
+      f" {t7_mean:>7.2f} µs | {t7_mean*64/1000:>7.2f} ms |"
+      f" {dec_mean/max(t7_mean,1e-6):>9.2f}x"
+  )
+  print(
+      f"{'8. Separate W_K, W_V + 2D Pallas Norm (Token Out)':<48} |"
+      f" {t8_mean:>7.2f} µs | {t8_mean*64/1000:>7.2f} ms |"
+      f" {dec_mean/max(t8_mean,1e-6):>9.2f}x"
+  )
+  print(
+      f"{'9. Separate W_K, W_V + Fused Norm/RoPE (Token Out)':<48} |"
+      f" {t9_mean:>7.2f} µs | {t9_mean*64/1000:>7.2f} ms |"
+      f" {dec_mean/max(t9_mean,1e-6):>9.2f}x"
   )
   print("=" * 90)
 

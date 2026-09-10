@@ -7,13 +7,12 @@ import jax.experimental.pallas as pl
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 
-try:
-  from google3.experimental.users.fangfangz.kernels.brpa_rope import bref_override, configs, flash_attention, schedule, stitch_utils, utils
-except (ModuleNotFoundError, ImportError):
-  try:
-    from experimental.users.fangfangz.kernels.brpa_rope import bref_override, configs, flash_attention, schedule, stitch_utils, utils
-  except (ModuleNotFoundError, ImportError):
-    from tpu_inference.kernels.experimental.brpa_rope import bref_override, configs, flash_attention, schedule, stitch_utils, utils
+from . import bref_override
+from . import configs
+from . import flash_attention
+from . import schedule
+from . import stitch_utils
+from . import utils
 
 
 def apply_in_kernel_rope(
@@ -76,16 +75,18 @@ def apply_in_kernel_rope(
     x_rot = x_rope * cos_full + x_swap * sin_full
   else:  # interleaved
     cos_full = jnp.repeat(cos, 2, axis=-1)
-    sin_full = jnp.stack([-sin, sin], axis=-1).reshape(*cos.shape[:-1], rope_dim)
+    sin_full = jnp.stack([-sin, sin], axis=-1).reshape(
+        *cos.shape[:-1], rope_dim
+    )
     if x.ndim == 4:
       cos_full = cos_full[:, None, :, :]
       sin_full = sin_full[:, None, :, :]
     elif x.ndim == 5:
       cos_full = cos_full[:, None, :, None, :]
       sin_full = sin_full[:, None, :, None, :]
-    x_swap = jnp.stack(
-        [x_rope[..., 1::2], x_rope[..., 0::2]], axis=-1
-    ).reshape(x_rope.shape)
+    x_swap = jnp.stack([x_rope[..., 1::2], x_rope[..., 0::2]], axis=-1).reshape(
+        x_rope.shape
+    )
     x_rot = x_rope * cos_full + x_swap * sin_full
 
   if has_pass:
@@ -461,7 +462,10 @@ def rpa_body(
 
 
 def create_allocs(
-    kv_cache_hbm_ref: jax.Ref, o_hbm_ref: jax.Ref, cfgs: configs.RpaConfigs
+    kv_cache_hbm_ref: jax.Ref,
+    q_hbm_ref: jax.Ref,
+    cfgs: configs.RpaConfigs,
+    o_hbm_ref: jax.Ref | None = None,
 ):
   kv_cache_spec = pl.BlockSpec(
       block_shape=cfgs.kv_vmem_shape,
@@ -496,14 +500,15 @@ def create_allocs(
   )
   q_alloc = bref_override.BatchingQRef.input(
       spec=q_spec,
-      dtype_or_type=o_hbm_ref,
+      dtype_or_type=q_hbm_ref,
       buffer_count=cfgs.n_buffer,
       use_lookahead=True,
       cfgs=cfgs,
   )
+  target_o_ref = o_hbm_ref if o_hbm_ref is not None else q_hbm_ref
   o_alloc = bref_override.BatchingORef.output(
       spec=o_spec,
-      dtype_or_type=o_hbm_ref,
+      dtype_or_type=target_o_ref,
       buffer_count=2,
       use_lookahead=False,
       cfgs=cfgs,
@@ -543,6 +548,7 @@ def rpa_kernel(
     kv_cache_hbm: jax.Array,
     *,
     cfgs: configs.RpaConfigs,
+    o_hbm: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array]:
   """Perform batched ragged paged attention with scheduler data.
 
@@ -590,7 +596,7 @@ def rpa_kernel(
     del o_kv_cache_hbm_ref
 
     q_alloc, kv_cache_alloc, o_alloc = create_allocs(
-        kv_cache_hbm_ref, q_hbm_ref, cfgs
+        kv_cache_hbm_ref, q_hbm_ref, cfgs, o_hbm_ref=o_hbm_ref
     )
 
     actual_steps = schedule_hbm_ref.actual_steps[0]
@@ -702,9 +708,20 @@ def rpa_kernel(
   q_hbm_idx = num_pre_leaves + num_sched_leaves
   kv_cache_hbm_idx = q_hbm_idx + 2
 
+  if (
+      o_hbm is not None
+      and cfgs.serve.out_token_major
+      and cfgs.serve.is_kv_group_major
+  ):
+    effective_out_shape = [o_hbm, kv_cache_hbm]
+    aliases = {kv_cache_hbm_idx: 1}
+  else:
+    effective_out_shape = [q_hbm, kv_cache_hbm]
+    aliases = {q_hbm_idx: 0, kv_cache_hbm_idx: 1}
+
   return pl.pallas_call(
       ragged_paged_attention_pipeline,
-      out_shape=[q_hbm, kv_cache_hbm],
+      out_shape=effective_out_shape,
       grid_spec=pltpu.PrefetchScalarGridSpec(
           num_scalar_prefetch=3,
           in_specs=[
@@ -714,7 +731,7 @@ def rpa_kernel(
               pl.BlockSpec(memory_space=pltpu.HBM),  # kv_cache_hbm_ref
           ],
           out_specs=[
-              pl.BlockSpec(memory_space=pltpu.HBM),  # aliased_o_hbm_ref
+              pl.BlockSpec(memory_space=pltpu.HBM),  # o_hbm_ref
               pl.BlockSpec(memory_space=pltpu.HBM),  # aliased_kv_cache_hbm_ref
           ],
       ),
@@ -722,7 +739,7 @@ def rpa_kernel(
           vmem_limit_bytes=cfgs.vmem_limit_bytes,
           disable_bounds_checks=True,
       ),
-      input_output_aliases={q_hbm_idx: 0, kv_cache_hbm_idx: 1},
+      input_output_aliases=aliases,
       name=get_kernel_name(cfgs),
       metadata=get_kernel_metadata(cfgs),
   )(

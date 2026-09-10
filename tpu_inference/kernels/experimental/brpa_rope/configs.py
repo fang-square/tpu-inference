@@ -6,10 +6,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
-try:
-  from google3.experimental.users.fangfangz.kernels.brpa_rope import utils
-except (ModuleNotFoundError, ImportError):
-  from . import utils
+from . import utils
 
 
 @dataclasses.dataclass(frozen=True)
@@ -140,8 +137,10 @@ class KVLayout(enum.StrEnum):
 class QLayout(enum.StrEnum):
   """Represents the different layouts for Query tensor.
 
-  - HEAD_MAJOR: [N_kv, T, G, D] (Grouped-by-KV-head major, zero-copy if permuted offline or via swapaxes)
-  - TOKEN_MAJOR_STRIDED: [T, N_kv, G, D] (Token-major layout with in-kernel strided DMA, zero-copy)
+  - HEAD_MAJOR: [N_kv, T, G, D] (Grouped-by-KV-head major, zero-copy if permuted
+  offline or via swapaxes)
+  - TOKEN_MAJOR_STRIDED: [T, N_kv, G, D] (Token-major layout with in-kernel
+  strided DMA, zero-copy)
   """
 
   HEAD_MAJOR = enum.auto()
@@ -165,6 +164,7 @@ class ServingConfigs:
   kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE
   use_strided_dma: bool = False
   is_kv_group_major: bool = False
+  out_token_major: bool = False
   smem_fraction_limit_for_schedule_generation: float = 0.33
   max_schedule_size_multiplier: int = 16
 
@@ -317,7 +317,7 @@ class RpaConfigs:
       num_elements = self.model.num_kv_heads * 2 * self.aligned_kv_head_dim
     else:
       num_elements = self.aligned_num_kv_heads_x2 * self.aligned_kv_head_dim
-    return num_elements * self.serve.dtype_kv.itemsize
+    return num_elements * jnp.dtype(self.serve.dtype_kv).itemsize
 
   @property
   def q_bytes_per_token(self) -> int:
@@ -325,7 +325,7 @@ class RpaConfigs:
         self.model.num_kv_heads
         * self.aligned_num_q_heads_per_kv_head
         * self.aligned_q_head_dim
-        * self.serve.dtype_q.itemsize
+        * jnp.dtype(self.serve.dtype_q).itemsize
     )
 
   @property
@@ -334,7 +334,7 @@ class RpaConfigs:
         self.model.num_kv_heads
         * self.aligned_num_q_heads_per_kv_head
         * self.aligned_q_head_dim
-        * self.serve.dtype_out.itemsize
+        * jnp.dtype(self.serve.dtype_out).itemsize
     )
 
   @property
@@ -482,9 +482,7 @@ class RpaConfigs:
             " is_kv_group_major=True"
         )
       if not (k.ndim == v.ndim == 3):
-        raise ValueError(
-            f"Expected 3D array for {k.shape=}, {v.shape=}"
-        )
+        raise ValueError(f"Expected 3D array for {k.shape=}, {v.shape=}")
       if q.shape[0] != self.model.num_kv_heads:
         raise ValueError(
             f"Expected {q.shape[0]=} to equal {self.model.num_kv_heads=}"
@@ -506,8 +504,8 @@ class RpaConfigs:
         )
       if not (q.shape[0] == k.shape[0] == v.shape[0]):
         raise ValueError(
-            "Expected number of sequences in Q, K, and V to be the same, but got"
-            f" {q.shape[0]=}, {k.shape[0]=}, and {v.shape[0]=}"
+            "Expected number of sequences in Q, K, and V to be the same, but"
+            f" got {q.shape[0]=}, {k.shape[0]=}, and {v.shape[0]=}"
         )
       if not (q.shape[2] == k.shape[2] == v.shape[2]):
         raise ValueError(

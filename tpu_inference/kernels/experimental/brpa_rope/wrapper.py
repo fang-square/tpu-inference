@@ -7,12 +7,21 @@ import jax.numpy as jnp
 import numpy as np
 
 try:
-  from google3.experimental.users.fangfangz.kernels.brpa_rope import configs, kernel, schedule, utils
+  from tpu_inference.kernels.experimental.brpa_rope import configs
 except (ModuleNotFoundError, ImportError):
-  try:
-    from experimental.users.fangfangz.kernels.brpa_rope import configs, kernel, schedule, utils
-  except (ModuleNotFoundError, ImportError):
-    from tpu_inference.kernels.experimental.brpa_rope import configs, kernel, schedule, utils
+  from google3.experimental.users.fangfangz.kernels.brpa_rope import configs
+try:
+  from tpu_inference.kernels.experimental.brpa_rope import kernel
+except (ModuleNotFoundError, ImportError):
+  from google3.experimental.users.fangfangz.kernels.brpa_rope import kernel
+try:
+  from tpu_inference.kernels.experimental.brpa_rope import schedule
+except (ModuleNotFoundError, ImportError):
+  from google3.experimental.users.fangfangz.kernels.brpa_rope import schedule
+try:
+  from tpu_inference.kernels.experimental.brpa_rope import utils
+except (ModuleNotFoundError, ImportError):
+  from google3.experimental.users.fangfangz.kernels.brpa_rope import utils
 
 
 def prepare_inputs(
@@ -138,12 +147,11 @@ def prepare_inputs(
   if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
     num_lanes = utils.get_num_lanes()
     padded_total_tokens = utils.align_to(total_q_tokens, num_lanes)
-    kv_stacked = jnp.stack([k, v], axis=1).reshape(
-        total_q_tokens, actual_num_kv_heads_x2, actual_head_dim
-    )
     new_kv_hbm = (
         jnp.pad(
-            kv_stacked,
+            jnp.concatenate([k, v], axis=-1).reshape(
+                total_q_tokens, actual_num_kv_heads_x2, actual_head_dim
+            ),
             (
                 (0, padded_total_tokens - total_q_tokens),
                 (0, 0),
@@ -160,21 +168,21 @@ def prepare_inputs(
         .transpose(1, 2, 3, 0)
     )
   else:
-    kv_stacked = jnp.stack([k, v], axis=1).reshape(
-        total_q_tokens,
-        num_kv_heads_x2_aligned // kv_packing,
-        kv_packing,
-        actual_head_dim,
-    )
     new_kv_hbm = jnp.pad(
-        kv_stacked,
+        jnp.concatenate([k, v], axis=-1).reshape(
+            total_q_tokens, actual_num_kv_heads_x2, actual_head_dim
+        ),
         (
             (0, 0),
-            (0, 0),
-            (0, 0),
+            (0, num_kv_heads_x2_aligned - actual_num_kv_heads_x2),
             (0, aligned_kv_head_dim - actual_head_dim),
         ),
         constant_values=0,
+    ).reshape(
+        total_q_tokens,
+        num_kv_heads_x2_aligned // kv_packing,
+        kv_packing,
+        aligned_kv_head_dim,
     )
   return o_hbm_alias_q_hbm, new_kv_hbm
 
@@ -443,6 +451,7 @@ def calculate_block_sizes(
         "rope_ordering",
         "is_kv_group_major",
         "use_strided_dma",
+        "out_token_major",
         "apply_rmsnorm",
         "norm_eps",
         "gamma_q",
@@ -483,6 +492,7 @@ def ragged_paged_attention(
     rope_ordering: str = "split",
     is_kv_group_major: bool = False,
     use_strided_dma: bool = False,
+    out_token_major: bool = False,
     apply_rmsnorm: bool = False,
     norm_eps: float = 1e-6,
     gamma_q: jax.Array | tuple[float, ...] | None = None,
@@ -611,6 +621,7 @@ def ragged_paged_attention(
       kv_layout=kv_layout,
       use_strided_dma=use_strided_dma,
       is_kv_group_major=is_kv_group_major,
+      out_token_major=out_token_major,
   )
 
   q_hbm, new_kv_hbm = prepare_inputs(
@@ -624,14 +635,34 @@ def ragged_paged_attention(
       use_strided_dma=use_strided_dma,
   )
 
+  o_hbm_separate = None
+  if out_token_major and is_kv_group_major:
+    q_packing = utils.get_dtype_packing(queries.dtype)
+    aligned_num_q_heads_per_kv_head = utils.align_to(
+        num_q_heads // num_kv_heads, q_packing
+    )
+    num_lanes = utils.get_num_lanes()
+    aligned_q_head_dim = utils.align_to(head_dim, num_lanes)
+    o_hbm_separate = jnp.zeros(
+        (
+            total_q_tokens,
+            num_kv_heads,
+            aligned_num_q_heads_per_kv_head // q_packing,
+            q_packing,
+            aligned_q_head_dim,
+        ),
+        dtype=out_dtype,
+    )
+
   default_decode, default_prefill = calculate_block_sizes(
       model_cfgs, serve_cfgs, vmem_limit_bytes
   )
 
   def run_rpa_kernel(
       mode: configs.RpaCase,
-      o_hbm_alias_q_hbm: jax.Array,
+      q_hbm_input: jax.Array,
       kv_cache: jax.Array,
+      target_o_hbm: jax.Array | None = None,
   ):
     if mode == configs.RpaCase.DECODE:
       effective_blocks = decode_block_sizes or default_decode
@@ -666,27 +697,39 @@ def ragged_paged_attention(
         kv_lens,
         page_indices,
         schedule_hbm,
-        o_hbm_alias_q_hbm,
+        q_hbm_input,
         new_kv_hbm,
         kv_cache,
         cfgs=cfgs,
+        o_hbm=target_o_hbm,
     )
 
-  o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(
-      configs.RpaCase.DECODE, q_hbm, kv_cache
-  )
-  o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(
-      configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache
-  )
+  if out_token_major and is_kv_group_major:
+    o_hbm, kv_cache = run_rpa_kernel(
+        configs.RpaCase.DECODE, q_hbm, kv_cache, target_o_hbm=o_hbm_separate
+    )
+    o_hbm, kv_cache = run_rpa_kernel(
+        configs.RpaCase.MIXED, q_hbm, kv_cache, target_o_hbm=o_hbm
+    )
+  else:
+    o_hbm_alias_q_hbm, kv_cache = run_rpa_kernel(
+        configs.RpaCase.DECODE, q_hbm, kv_cache
+    )
+    o_hbm, kv_cache = run_rpa_kernel(
+        configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache
+    )
 
   # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d] or [max_tokens, kv_heads, ...]
-  o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
+  o_hbm = prepare_outputs(o_hbm)
   # after: [kv_heads, max_tokens, q_per_kv, d] or [max_tokens, kv_heads, q_per_kv, d]
 
   # slice back to original shape if padded
   num_q_heads_per_kv_head = num_q_heads // num_kv_heads
   o_hbm = o_hbm[:, :, :num_q_heads_per_kv_head, :head_dim]
-  if use_strided_dma and not is_kv_group_major:
+  if out_token_major:
+    # Directly token-major [T, H_kv, G, D] -> [T, H_q, D] without any transpose!
+    o_hbm = o_hbm.reshape(total_q_tokens, num_q_heads, head_dim)
+  elif use_strided_dma and not is_kv_group_major:
     # o_hbm is [T, H_kv, G, D] -> reshape directly to [T, H_q, D] (zero copy)
     o_hbm = o_hbm.reshape(total_q_tokens, num_q_heads, head_dim)
   elif not is_kv_group_major:
@@ -721,11 +764,13 @@ def ragged_paged_attention_rope(
     kv_layout: configs.KVLayout = configs.KVLayout.HEAD_ALONG_SUBLANE,
     is_kv_group_major: bool = False,
     use_strided_dma: bool = False,
+    out_token_major: bool = False,
     apply_rmsnorm: bool = False,
     norm_eps: float = 1e-6,
     gamma_q: jax.Array | tuple[float, ...] | None = None,
     apply_k_rmsnorm: bool = False,
     gamma_k: jax.Array | tuple[float, ...] | None = None,
+    apply_rope: bool = True,
 ) -> tuple[jax.Array, jax.Array]:
   """Wrapper for bRPA with in-kernel RoPE enabled."""
   return ragged_paged_attention(
@@ -749,12 +794,13 @@ def ragged_paged_attention_rope(
       vmem_limit_bytes=vmem_limit_bytes,
       out_dtype=out_dtype,
       kv_layout=kv_layout,
-      apply_rope=True,
+      apply_rope=apply_rope,
       rope_theta=rope_theta,
       rope_dim=rope_dim,
       rope_ordering=rope_input_ordering,
       is_kv_group_major=is_kv_group_major,
       use_strided_dma=use_strided_dma,
+      out_token_major=out_token_major,
       apply_rmsnorm=apply_rmsnorm,
       norm_eps=norm_eps,
       gamma_q=gamma_q,

@@ -423,6 +423,11 @@ def sharded_ragged_paged_attention(
   is_kv_group_major = (
       envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA
       or envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA
+      or envs.USE_HEAD_MAJOR_Q_SEPARATE_KV_RPA
+  )
+  use_out_token_major = (
+      envs.USE_OUT_TOKEN_MAJOR
+      or (envs.USE_HEAD_MAJOR_Q_SEPARATE_KV_RPA and getattr(envs, "USE_OUT_TOKEN_MAJOR", True))
   )
   use_strided_dma = envs.USE_STRIDED_IN_KERNEL_ROPE_RPA
   use_in_kernel_rope_active = (
@@ -430,11 +435,15 @@ def sharded_ragged_paged_attention(
       or envs.USE_STRIDED_IN_KERNEL_ROPE_RPA
       or envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA
       or envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA
+      or envs.USE_HEAD_MAJOR_Q_SEPARATE_KV_RPA
   )
 
   if is_kv_group_major:
     q_spec = P(ShardingAxisName.ATTN_HEAD, ShardingAxisName.ATTN_DATA, None, None)
-    out_q_spec = P(ShardingAxisName.ATTN_HEAD, ShardingAxisName.ATTN_DATA, None, None)
+    if use_out_token_major:
+      out_q_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None)
+    else:
+      out_q_spec = P(ShardingAxisName.ATTN_HEAD, ShardingAxisName.ATTN_DATA, None, None)
   else:
     q_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None)
     out_q_spec = P(ShardingAxisName.ATTN_DATA, ShardingAxisName.ATTN_HEAD, None)
@@ -493,6 +502,7 @@ def sharded_ragged_paged_attention(
       kwargs["rope_input_ordering"] = rope_input_ordering
       kwargs["use_strided_dma"] = use_strided_dma
       kwargs["is_kv_group_major"] = is_kv_group_major
+      kwargs["out_token_major"] = use_out_token_major
       if brpa_configs is not None:
         kwargs["decode_block_sizes"] = brpa_configs.BlockSizes(
             bq_sz=1, bq_c_sz=1, bkv_sz=256, batch_size=4, n_buffer=2

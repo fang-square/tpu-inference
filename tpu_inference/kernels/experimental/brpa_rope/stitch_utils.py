@@ -3,10 +3,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 import jax.numpy as jnp
 
-try:
-  from google3.experimental.users.fangfangz.kernels.brpa_rope import configs
-except (ModuleNotFoundError, ImportError):
-  from . import configs
+from . import configs
 
 
 def _stitch_decode_lane(

@@ -435,7 +435,11 @@ class Qwen3Attention(JaxModule):
         self.mesh = mesh
         self.additional_config = additional_config
 
-        if envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA or envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA:
+        if (
+            envs.USE_HEAD_MAJOR_Q_SEPARATE_KV_RPA
+            or envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA
+            or envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA
+        ):
             rhs_str = "KDN"
             num_q_heads_per_kv = self.num_heads // self.num_kv_heads
             q_proj_sharding = ("model", None, None)
@@ -550,6 +554,7 @@ class Qwen3Attention(JaxModule):
             or envs.USE_STRIDED_IN_KERNEL_ROPE_RPA
             or envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA
             or envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA
+            or envs.USE_HEAD_MAJOR_Q_SEPARATE_KV_RPA
         )
         self.kv_cache_quantized_dtype = None
         if kv_cache_dtype != "auto":
@@ -568,10 +573,15 @@ class Qwen3Attention(JaxModule):
             or envs.USE_STRIDED_IN_KERNEL_ROPE_RPA
             or envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA
             or envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA
+            or envs.USE_HEAD_MAJOR_Q_SEPARATE_KV_RPA
         )
 
         # q: (T, N, H) or (K, T, G, H)
-        if envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA or envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA:
+        if (
+            envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA
+            or envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA
+            or envs.USE_HEAD_MAJOR_Q_SEPARATE_KV_RPA
+        ):
             if hasattr(x, "qvalue"):
                 x_qval = jnp.broadcast_to(
                     x.qvalue[None, :, :], (self.num_kv_heads, x.shape[0], self.hidden_size)
@@ -657,10 +667,22 @@ class Qwen3Attention(JaxModule):
             use_in_kernel_rope=use_in_kernel_rope,
             rope_theta=self.rope_theta,
         )
-        if envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA or envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA:
-            outputs = outputs.swapaxes(0, 1).reshape(
-                x.shape[0], self.num_heads, self.head_dim
+        use_out_token_major = (
+            envs.USE_OUT_TOKEN_MAJOR
+            or (
+                envs.USE_HEAD_MAJOR_Q_SEPARATE_KV_RPA
+                and getattr(envs, "USE_OUT_TOKEN_MAJOR", True)
             )
+        )
+        if (
+            envs.USE_KV_HEAD_MAJOR_IN_KERNEL_ROPE_RPA
+            or envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA
+            or envs.USE_HEAD_MAJOR_Q_SEPARATE_KV_RPA
+        ):
+            if not use_out_token_major:
+                outputs = outputs.swapaxes(0, 1).reshape(
+                    x.shape[0], self.num_heads, self.head_dim
+                )
         # (T, D)
         if envs.USE_FUSED_ALL_REDUCE_MATMUL:
             if (
@@ -1140,6 +1162,13 @@ class Qwen3ForCausalLM(JaxModule, LoadableWithIterator):
 
     def __init__(self, vllm_config: VllmConfig, rng_key: jax.Array,
                  mesh: Mesh) -> None:
+        if not envs.USE_HEAD_MAJOR_Q_JOINT_KV_RPA:
+            self.packed_modules_mapping = {
+                "gate_up_proj": [
+                    "gate_proj",
+                    "up_proj",
+                ],
+            }
         self.vllm_config = vllm_config
         rng = nnx.Rngs(rng_key)
         self.mesh = mesh

@@ -8,11 +8,15 @@ import jax
 import jax.numpy as jnp
 
 try:
-  from google3.experimental.users.fangfangz.kernels.brpa_rope import configs
-  from google3.experimental.users.fangfangz.kernels.brpa_rope.wrapper import prepare_inputs
-except ModuleNotFoundError:
-  from experimental.users.fangfangz.kernels.brpa_rope import configs
-  from experimental.users.fangfangz.kernels.brpa_rope.wrapper import prepare_inputs
+  from tpu_inference.kernels.experimental.brpa_rope import configs
+  from tpu_inference.kernels.experimental.brpa_rope.wrapper import prepare_inputs
+except (ModuleNotFoundError, ImportError):
+  try:
+    from google3.experimental.users.fangfangz.kernels.brpa_rope import configs
+    from google3.experimental.users.fangfangz.kernels.brpa_rope.wrapper import prepare_inputs
+  except ModuleNotFoundError:
+    from experimental.users.fangfangz.kernels.brpa_rope import configs
+    from experimental.users.fangfangz.kernels.brpa_rope.wrapper import prepare_inputs
 
 
 def analyze_layout_overhead(kv_layout_name: str, kv_layout: configs.KVLayout):
@@ -127,13 +131,19 @@ def analyze_kv_group_major_layout():
   kv_dtype = jnp.bfloat16
 
   # Q is produced directly as [N_kv, T, G, D] by offline-permuted Q-GEMM
-  q_kv_major = jnp.ones((num_kv_heads, total_tokens, g, head_dim), dtype=q_dtype)
+  q_kv_major = jnp.ones(
+      (num_kv_heads, total_tokens, g, head_dim), dtype=q_dtype
+  )
   k = jnp.ones((total_tokens, num_kv_heads, head_dim), dtype=kv_dtype)
   v = jnp.ones((total_tokens, num_kv_heads, head_dim), dtype=kv_dtype)
 
   def prepare_fn(q_in, k_in, v_in):
     return prepare_inputs(
-        q_in, k_in, v_in, q_dtype, kv_dtype,
+        q_in,
+        k_in,
+        v_in,
+        q_dtype,
+        kv_dtype,
         kv_layout=configs.KVLayout.HEAD_ALONG_SUBLANE,
         is_kv_group_major=True,
     )
@@ -150,7 +160,11 @@ def analyze_kv_group_major_layout():
     print(f"   * {t}", flush=True)
 
   if len(transposes) == 0:
-    print(">>> CONFIRMED: 0 TRANSPOSES GENERATED FOR Q! ZERO-COPY HBM HANDOVER ACHIEVED! <<<", flush=True)
+    print(
+        ">>> CONFIRMED: 0 TRANSPOSES GENERATED FOR Q! ZERO-COPY HBM HANDOVER"
+        " ACHIEVED! <<<",
+        flush=True,
+    )
 
 
 def analyze_token_major_strided_layout():
@@ -191,9 +205,7 @@ def analyze_token_major_strided_layout():
   transposes = [
       l.strip() for l in lines if "transpose" in l.lower() and "=" in l
   ]
-  print(
-      f"1. Transpose Operations for Q ({len(transposes)} found):", flush=True
-  )
+  print(f"1. Transpose Operations for Q ({len(transposes)} found):", flush=True)
   for t in transposes:
     print(f"   * {t}", flush=True)
 
